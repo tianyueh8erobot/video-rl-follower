@@ -1,0 +1,30 @@
+defaults:
+  - VideoRLFollowerLSTMAsymmetricPPO
+  - _self_
+
+params:
+  algo:
+    # Switch to our DAPG-augmented PPO agent (registered in
+    # isaacgymenvs/algos/dapg.py via isaacgymenvs/__init__.py).
+    name: dapg
+
+  config:
+    name: ${resolve_default:VideoRLFollowerLSTMAsymmetricDAPG,${....experiment}}
+
+    # ----- DAPG-specific options -----
+    dapg:
+      # Path to a .pt file that exposes a dict {"observations": (M, obs_dim),
+      # "actions": (M, act_dim)} with M expert (s, a) pairs.  Generate with
+      # tools/collect_demo.py from a teleop or oracle policy on the same
+      # trajectory.
+      demo_path: data/demos/example_g0_demo.pt
+
+      # Total weight of the auxiliary loss on the policy update.
+      lambda_init: 0.1
+      # Multiplicative decay applied every PPO epoch (so that BC fades out
+      # as the policy improves; matches Rajeswaran 2017).
+      lambda_decay: 0.999
+
+      # Minibatch size used to sample (s, a) pairs from the demo buffer per
+      # gradient step.  Set to 0 to use the same minibatch size as PPO.
+      demo_minibatch_size: 1024
