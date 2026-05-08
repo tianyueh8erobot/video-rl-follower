@@ -161,6 +161,12 @@ env:
   updateStepSizeTylerCurriculum: 0.01
 
   # related to Asymmetric Observation
+  # The hand-goal channels (``wrist_goal`` and ``fingertip_goal_local``) are
+  # added by the VideoRLFollower subclass *after* super().__init__(), and the
+  # gym observation_space / state_space and obs delay queue are resized to
+  # match.  We intentionally do NOT add them to obs_list/state_list here
+  # because SimToolReal's __init__ enforces that every entry must be a known
+  # key in its hard-coded obs_type_size_dict.
   stateList: ["joint_pos", "joint_vel", "prev_action_targets", "palm_pos", "palm_rot", "palm_vel", "object_rot", "object_vel", "fingertip_pos_rel_palm", "keypoints_rel_palm", "keypoints_rel_goal", "object_scales", "closest_keypoint_max_dist", "closest_fingertip_dist", "lifted_object", "progress", "successes", "reward"]
   obsList: ["joint_pos", "joint_vel", "prev_action_targets", "palm_pos", "palm_rot", "object_rot", "fingertip_pos_rel_palm", "keypoints_rel_palm", "keypoints_rel_goal", "object_scales"]
   fixedSizeKeypointReward: True

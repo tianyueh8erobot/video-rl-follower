@@ -175,6 +175,12 @@ def _viz_open3d(traj: dict) -> None:
     obj_R = _quat_xyzw_to_rotmat(obj_goals[:, 3:7])
     wrist_R = _quat_xyzw_to_rotmat(wrist[:, 3:7])
 
+    def _hex_to_rgb01(name: str) -> np.ndarray:
+        s = _FINGER_COLORS.get(name, "#888888")
+        return np.array(
+            [int(s[1:3], 16) / 255.0, int(s[3:5], 16) / 255.0, int(s[5:7], 16) / 255.0]
+        )
+
     geoms: list = []
 
     obj_path = o3d.geometry.LineSet()
@@ -185,30 +191,27 @@ def _viz_open3d(traj: dict) -> None:
     obj_path.colors = o3d.utility.Vector3dVector(np.tile([0.4, 0.4, 0.4], (T - 1, 1)))
     geoms.append(obj_path)
 
-    object_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
-    geoms.append(object_frame)
-    wrist_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.04)
-    geoms.append(wrist_frame)
+    # We rebuild coordinate-frame meshes every frame instead of trying to
+    # compose deltas through TriangleMesh.transform(); this avoids the
+    # 3x3-vs-4x4 confusion and floating-point compounding.
+    def _coord_frame(pose7: np.ndarray, size: float) -> "o3d.geometry.TriangleMesh":
+        m = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size)
+        T = np.eye(4)
+        T[:3, :3] = _quat_xyzw_to_rotmat(pose7[3:7])
+        T[:3, 3] = pose7[:3]
+        m.transform(T)  # 4x4
+        return m
+
+    object_frame = _coord_frame(obj_goals[0], 0.05)
+    wrist_frame = _coord_frame(wrist[0], 0.04)
+    geoms.extend([object_frame, wrist_frame])
 
     ftip_spheres = []
     for k in range(K):
         name = fingertip_order[k] if k < len(fingertip_order) else f"f{k}"
-        color = np.array(
-            o3d.utility.Vector3dVector(
-                [list(int(c) / 255.0 for c in (
-                    _FINGER_COLORS.get(name, "#888888")[1:3],
-                    _FINGER_COLORS.get(name, "#888888")[3:5],
-                    _FINGER_COLORS.get(name, "#888888")[5:7],
-                ))][0]
-            )
-        )
         sph = o3d.geometry.TriangleMesh.create_sphere(radius=0.008)
-        col = np.array([
-            int(_FINGER_COLORS.get(name, "#888888")[1:3], 16) / 255.0,
-            int(_FINGER_COLORS.get(name, "#888888")[3:5], 16) / 255.0,
-            int(_FINGER_COLORS.get(name, "#888888")[5:7], 16) / 255.0,
-        ])
-        sph.paint_uniform_color(col)
+        sph.paint_uniform_color(_hex_to_rgb01(name))
+        sph.translate(ftips_w[0, k])
         ftip_spheres.append(sph)
         geoms.append(sph)
 
@@ -220,27 +223,35 @@ def _viz_open3d(traj: dict) -> None:
     for g in geoms:
         vis.add_geometry(g)
 
-    state = {"t": 0, "playing": False}
+    state = {"t": 0, "playing": False, "prev_obj": obj_goals[0].copy(),
+             "prev_wrist": wrist[0].copy(), "prev_ftips": ftips_w[0].copy()}
 
-    def update():
+    def update() -> None:
         t = state["t"]
-        # Object frame
-        object_frame.transform(np.linalg.inv(object_frame.get_rotation_matrix_from_xyz((0, 0, 0))))  # noqa
-        # Easier: rebuild transform each frame
-        T_obj = np.eye(4)
-        T_obj[:3, :3] = obj_R[t]
-        T_obj[:3, 3] = obj_goals[t, :3]
-        object_frame.transform(T_obj)
-        T_wrist = np.eye(4)
-        T_wrist[:3, :3] = wrist_R[t]
-        T_wrist[:3, 3] = wrist[t, :3]
-        wrist_frame.transform(T_wrist)
+        # Roll back the previous frame transform so we don't compound errors.
+        prev_obj_T = np.eye(4)
+        prev_obj_T[:3, :3] = _quat_xyzw_to_rotmat(state["prev_obj"][3:7])
+        prev_obj_T[:3, 3] = state["prev_obj"][:3]
+        object_frame.transform(np.linalg.inv(prev_obj_T))
+
+        prev_wr_T = np.eye(4)
+        prev_wr_T[:3, :3] = _quat_xyzw_to_rotmat(state["prev_wrist"][3:7])
+        prev_wr_T[:3, 3] = state["prev_wrist"][:3]
+        wrist_frame.transform(np.linalg.inv(prev_wr_T))
+
+        new_obj_T = np.eye(4)
+        new_obj_T[:3, :3] = obj_R[t]
+        new_obj_T[:3, 3] = obj_goals[t, :3]
+        object_frame.transform(new_obj_T)
+
+        new_wr_T = np.eye(4)
+        new_wr_T[:3, :3] = wrist_R[t]
+        new_wr_T[:3, 3] = wrist[t, :3]
+        wrist_frame.transform(new_wr_T)
 
         for k in range(K):
             sph = ftip_spheres[k]
-            # Recreate translation (Open3D meshes are by-reference; reset to origin then translate)
-            sph.translate(-sph.get_center())
-            sph.translate(ftips_w[t, k])
+            sph.translate(ftips_w[t, k] - state["prev_ftips"][k])
 
         # bones from wrist to each fingertip
         pts = np.concatenate([wrist[t:t + 1, :3], ftips_w[t]], axis=0)
@@ -250,11 +261,11 @@ def _viz_open3d(traj: dict) -> None:
         )
         bones.colors = o3d.utility.Vector3dVector(np.tile([0.2, 0.2, 0.2], (K, 1)))
 
+        state["prev_obj"] = obj_goals[t].copy()
+        state["prev_wrist"] = wrist[t].copy()
+        state["prev_ftips"] = ftips_w[t].copy()
         for g in geoms:
             vis.update_geometry(g)
-        # Reset frames so transforms don't compound on next call
-        object_frame.transform(np.linalg.inv(T_obj))
-        wrist_frame.transform(np.linalg.inv(T_wrist))
 
     def step(direction: int):
         state["t"] = (state["t"] + direction) % T

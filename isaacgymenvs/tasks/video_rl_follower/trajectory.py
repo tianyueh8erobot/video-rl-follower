@@ -62,15 +62,43 @@ class ReferenceTrajectory:
         self.object_urdf_path = object_urdf_path
         self.object_scale = float(object_scale)
 
+        if object_start_pose.shape != (7,):
+            raise ValueError(
+                f"object_start_pose must be shape (7,), got {tuple(object_start_pose.shape)}"
+            )
+        if object_goals.ndim != 2 or object_goals.shape[1] != 7:
+            raise ValueError(
+                f"object_goals must be shape (T, 7), got {tuple(object_goals.shape)}"
+            )
+        if wrist_goals.shape != object_goals.shape:
+            raise ValueError(
+                f"wrist_goals must be shape (T, 7), got {tuple(wrist_goals.shape)}"
+            )
         T = object_goals.shape[0]
-        assert wrist_goals.shape[0] == T, "wrist_goals length mismatch"
-        assert fingertip_goals.shape[0] == T, "fingertip_goals length mismatch"
-        assert fingertip_local.shape[0] == T, "fingertip_local length mismatch"
-        assert fingertip_goals.shape[-1] == 3 and fingertip_local.shape[-1] == 3
-        assert fingertip_goals.shape[1] == fingertip_local.shape[1]
+        if T == 0:
+            raise ValueError("trajectory must contain at least one goal frame")
+        if fingertip_goals.ndim != 3 or fingertip_goals.shape[0] != T or fingertip_goals.shape[2] != 3:
+            raise ValueError(
+                "fingertip_goals must be shape (T, K, 3), got "
+                f"{tuple(fingertip_goals.shape)} (T={T})"
+            )
+        if fingertip_local.shape != fingertip_goals.shape:
+            raise ValueError(
+                "fingertip_local must match fingertip_goals shape, got "
+                f"{tuple(fingertip_local.shape)} vs {tuple(fingertip_goals.shape)}"
+            )
+        K = int(fingertip_goals.shape[1])
+        if K == 0:
+            raise ValueError("trajectory must declare at least one fingertip")
+
+        order = list(meta.get("fingertip_order", []))
+        if order and len(order) != K:
+            raise ValueError(
+                f"meta.fingertip_order has {len(order)} entries but the data has K={K}"
+            )
 
         self.num_goals = T
-        self.num_fingertips = int(fingertip_goals.shape[1])
+        self.num_fingertips = K
 
         self.object_start_pose = object_start_pose.float()           # (7,)
         self.object_goals = object_goals.float()                     # (T, 7)

@@ -10,11 +10,11 @@ Differences from the base ``SimToolReal``:
   filled from the loaded reference instead of from cfg's ``fixedGoalStates``.
 * The reward adds two hand-pose terms (wrist-pose + fingertip-position) on top
   of the original object-keypoint reward, with configurable weights.
-* The observation/state buffer is extended with the next reference wrist pose
-  and fingertip positions in the wrist-local frame, matching the structure
-  SimToolReal uses for object goals.
-* Object URDF/scale come from the trajectory file (procedural primitive
-  generation is bypassed when ``trajectory.object.urdf_path`` is set).
+* The observation/state buffers are extended with two tail blocks
+  ``(wrist_goal, fingertip_goal_local)`` after the base class assembles
+  ``obs_buf``/``states_buf``.  We RESIZE the gym observation_space, state_space
+  and the obs delay queue to match, so that rl_games observes the correct
+  shapes and the action-latency simulation continues to work.
 
 Single-hand only.  Bimanual support is out of scope for this codebase fork.
 """
@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
 
+import numpy as np
 import torch
+from gym import spaces
 from torch import Tensor
 
 from isaacgymenvs.tasks.simtoolreal.env import SimToolReal
@@ -33,27 +35,29 @@ from isaacgymenvs.tasks.simtoolreal.env import SimToolReal
 from .trajectory import ReferenceTrajectory
 
 
+# ---------------------------------------------------------------------------
+# Quaternion helpers (xyzw layout, matches SimToolReal's keypoint rotation use)
+# ---------------------------------------------------------------------------
+
+
 def _quat_inverse_xyzw(q: Tensor) -> Tensor:
-    # Conjugate of a unit quaternion; xyzw layout matches SimToolReal's keypoints
+    """Conjugate of a unit quaternion."""
     out = q.clone()
     out[..., :3] *= -1.0
     return out
 
 
-def _quat_mul_xyzw(a: Tensor, b: Tensor) -> Tensor:
-    # Hamilton product, both inputs xyzw
-    ax, ay, az, aw = a.unbind(-1)
-    bx, by, bz, bw = b.unbind(-1)
-    x = aw * bx + ax * bw + ay * bz - az * by
-    y = aw * by - ax * bz + ay * bw + az * bx
-    z = aw * bz + ax * by - ay * bx + az * bw
-    w = aw * bw - ax * bx - ay * by - az * bz
-    return torch.stack([x, y, z, w], dim=-1)
+def _quat_rotate_xyzw(q: Tensor, v: Tensor) -> Tensor:
+    """Rotate vector ``v`` by quaternion ``q`` (xyzw)."""
+    qv = q[..., :3]
+    qw = q[..., 3:]
+    t = 2.0 * torch.cross(qv, v, dim=-1)
+    return v + qw * t + torch.cross(qv, t, dim=-1)
 
 
 def _quat_geodesic_angle_xyzw(a: Tensor, b: Tensor) -> Tensor:
     """Returns the angle (radians) between two unit quaternions."""
-    dot = (a * b).sum(-1).abs().clamp(-1.0, 1.0)
+    dot = (a * b).sum(-1).abs().clamp(-1.0 + 1e-7, 1.0 - 1e-7)
     return 2.0 * torch.acos(dot)
 
 
@@ -69,31 +73,22 @@ class VideoRLFollower(SimToolReal):
     ``env.handPoseRewardScale.lambdaWristPos`` float decay rate (m^-1)
     ``env.handPoseRewardScale.lambdaWristRot`` float decay rate (rad^-1)
     ``env.handPoseRewardScale.lambdaFingertip`` float decay rate (m^-1)
-    ``env.exposeHandGoalToPolicy``             bool  add hand goal to obs (default True)
+    ``env.exposeHandGoalToPolicy``             bool  append hand goal to obs
     """
 
     def __init__(self, cfg, *args, **kwargs):
-        # Force fixed-goal mode; we do not want the base class to sample random
-        # delta goals.
-        cfg["env"]["useFixedGoalStates"] = True
-        # Provide a single dummy fixed goal so base init doesn't crash trying to
-        # parse fixedGoalStates; we will overwrite trajectory_states below.
-        cfg["env"]["fixedGoalStates"] = [
-            [0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0]
-        ]
-
+        # ----- Resolve trajectory path -----
         traj_path = cfg["env"].get("trajectoryPath", None)
         if traj_path is None:
             raise ValueError(
                 "VideoRLFollower requires env.trajectoryPath to point at a "
                 "JSON trajectory produced by tools/process_maniptrans_trajectory.py"
             )
-
-        # Resolve relative paths against the project root rather than the cwd.
         if not os.path.isabs(traj_path):
             project_root = Path(__file__).resolve().parents[3]
             traj_path = str(project_root / traj_path)
         self._trajectory_path = traj_path
+        self._trajectory = ReferenceTrajectory.from_file(self._trajectory_path)
 
         # Hand-reward weights (with sensible defaults).
         h_cfg = cfg["env"].get("handPoseRewardScale", {}) or {}
@@ -107,38 +102,84 @@ class VideoRLFollower(SimToolReal):
             cfg["env"].get("exposeHandGoalToPolicy", True)
         )
 
-        # Load trajectory on CPU first; will move to device after super().__init__
-        self._trajectory = ReferenceTrajectory.from_file(self._trajectory_path)
-
-        # Tell base class how big trajectory_states will be so that it can
-        # allocate the right tensor.  SimToolReal currently only consumes
-        # columns [0:7] (object pose); the additional columns are stored but
-        # ignored by the base reward path.
+        # ----- Force fixed-goal mode -----
+        # The base class only ever reads trajectory_states[..., 0:7] for the
+        # object goal; we override the tensor below with a richer one.
+        cfg["env"]["useFixedGoalStates"] = True
+        cfg["env"]["fixedGoalStates"] = [
+            [0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0]
+        ]
         cfg["env"]["maxConsecutiveSuccesses"] = self._trajectory.num_goals
 
         super().__init__(cfg, *args, **kwargs)
 
-        # Move trajectory to env device and pre-build the dense state tensor.
+        # ----- Move trajectory to env device, install dense state tensor -----
         self._trajectory.to(self.device)
-        dense = self._trajectory.stacked_goals()
-        # SimToolReal stores trajectory_states as (K, _, _) of dtype float32;
-        # see _reset_target.  We replace it here with our richer tensor.
-        self.trajectory_states = dense                                 # (T, D)
+        self.trajectory_states = self._trajectory.stacked_goals()
         self.max_consecutive_successes = self._trajectory.num_goals
         self._traj_K = self._trajectory.num_fingertips
 
-        # Pre-allocate per-env hand goal buffers (overwritten on each goal reset)
+        # Per-env hand goal buffers.
         self._wrist_goal = torch.zeros(
             (self.num_envs, 7), device=self.device, dtype=torch.float32
         )
         self._fingertip_goal_local = torch.zeros(
             (self.num_envs, self._traj_K, 3), device=self.device, dtype=torch.float32
         )
+        self._fingertip_curr_local = torch.zeros_like(self._fingertip_goal_local)
 
-        # Initialise goal index 0 for every env (base class also calls
-        # _reset_target; call again here is safe and idempotent).
         env_ids = torch.arange(self.num_envs, device=self.device)
         self._set_hand_goal_from_trajectory(env_ids)
+
+        if self.expose_hand_goal_to_policy:
+            self._extend_obs_state_spaces()
+
+    # ------------------------------------------------------------------
+    # Space + queue resize so rl_games sees the correct shapes
+    # ------------------------------------------------------------------
+
+    def _extend_obs_state_spaces(self) -> None:
+        """Extend gym observation_space, state_space and the obs delay queue
+        to account for the hand-goal channels appended in
+        ``populate_obs_and_states_buffers``.
+        """
+        extra = self.hand_goal_obs_dim                           # 7 + K*3
+
+        # 1) gym spaces — rl_games reads these to size the network heads.
+        new_obs_size = self.num_observations + extra
+        new_state_size = self.num_states + extra
+        self.num_observations = new_obs_size
+        self.num_states = new_state_size
+        self.obs_space = spaces.Box(
+            np.ones(new_obs_size) * -np.inf,
+            np.ones(new_obs_size) * np.inf,
+        )
+        self.state_space = spaces.Box(
+            np.ones(new_state_size) * -np.inf,
+            np.ones(new_state_size) * np.inf,
+        )
+        # Mirror back to cfg so any downstream readers (e.g., logging) agree.
+        self.cfg["env"]["numObservations"] = new_obs_size
+        self.cfg["env"]["numStates"] = new_state_size
+
+        # 2) obs delay queue — base class allocates it to (N, L, num_obs).
+        if hasattr(self, "obs_queue"):
+            old = self.obs_queue
+            new = torch.zeros(
+                old.shape[0], old.shape[1], new_obs_size,
+                dtype=old.dtype, device=old.device,
+            )
+            new[..., : old.shape[-1]] = old
+            self.obs_queue = new
+
+        # 3) re-allocate obs_buf and states_buf so rl_games sees the right
+        #    shape on the very first ``reset()`` (before any compute step).
+        self.obs_buf = torch.zeros(
+            self.num_envs, new_obs_size, dtype=torch.float32, device=self.device
+        )
+        self.states_buf = torch.zeros(
+            self.num_envs, new_state_size, dtype=torch.float32, device=self.device
+        )
 
     # ------------------------------------------------------------------
     # Trajectory-aware goal handling
@@ -168,19 +209,34 @@ class VideoRLFollower(SimToolReal):
             tensor_reset=tensor_reset,
             is_first_goal=is_first_goal,
         )
-        # Update our hand goals in lockstep.
         if len(env_ids) > 0 and reset_buf_idxs is None and tensor_reset:
             self._set_hand_goal_from_trajectory(env_ids)
+
+    # ------------------------------------------------------------------
+    # Frame helpers
+    # ------------------------------------------------------------------
+
+    def _current_fingertips_in_wrist_local(self) -> Tensor:
+        """Return current fingertip positions expressed in the wrist-local frame.
+
+        SimToolReal exposes ``self.fingertip_pos_rel_palm`` (palm-relative in
+        *world* axes) and ``self._palm_state[:, 3:7]`` (palm rotation, xyzw).
+        We rotate that offset by the inverse palm orientation to get a frame
+        that matches the ``fingertip_local`` channels stored in the trajectory
+        file.
+        """
+        offsets_world = self.fingertip_pos_rel_palm                 # (N, K, 3)
+        palm_quat = self._palm_state[:, 3:7]                        # (N, 4)
+        inv_q = _quat_inverse_xyzw(palm_quat).unsqueeze(1)          # (N, 1, 4)
+        K = offsets_world.shape[1]
+        return _quat_rotate_xyzw(inv_q.expand(-1, K, -1), offsets_world)
 
     # ------------------------------------------------------------------
     # Reward
     # ------------------------------------------------------------------
 
     def _hand_pose_reward(self) -> Tuple[Tensor, Tensor, Tensor]:
-        """Compute three hand-pose reward terms, each in [0, 1] before scaling.
-
-        Returns ``(wrist_pos_rew, wrist_rot_rew, fingertip_rew)`` shape (N,).
-        """
+        """Compute three hand-pose reward terms, each in [0, 1] before scaling."""
         # 1) wrist position
         wrist_pos_curr = self._palm_state[:, :3]
         wrist_pos_goal = self._wrist_goal[:, :3]
@@ -194,24 +250,21 @@ class VideoRLFollower(SimToolReal):
         wrist_rot_rew = torch.exp(-self.lambda_wrist_rot * ang)
 
         # 3) fingertip positions in wrist-local frame
-        # (a) current fingertip positions in world (already on env)
-        # SimToolReal exposes ``self.fingertip_pos_rel_palm`` that we can compare
-        # against ``self._fingertip_goal_local`` directly.
-        ftip_local_curr = self.fingertip_pos_rel_palm                 # (N, K, 3)
-        # If the env was configured with a different number of fingertips than
-        # the trajectory, truncate to the smaller one defensively.
+        ftip_local_curr = self._current_fingertips_in_wrist_local()
         K = min(ftip_local_curr.shape[1], self._fingertip_goal_local.shape[1])
         delta = ftip_local_curr[:, :K] - self._fingertip_goal_local[:, :K]
         d_ftip = torch.norm(delta, dim=-1).mean(dim=-1)               # mean over K
         fingertip_rew = torch.exp(-self.lambda_fingertip * d_ftip)
 
+        # Cache for obs reuse so populate_obs_and_states_buffers doesn't
+        # recompute the rotation.
+        self._fingertip_curr_local = ftip_local_curr
         return wrist_pos_rew, wrist_rot_rew, fingertip_rew
 
     def compute_kuka_reward(self) -> Tuple[Tensor, Tensor]:
-        # Base class fills self.rew_buf with the object-goal reward (and
-        # writes to self.reset_buf, success counters, etc.).  We add the hand
-        # terms on top.
-        super().compute_kuka_reward()
+        # Base class returns (rew_buf, is_success).  Capture both — we rely on
+        # is_success for downstream stats and resets rather than self.reset_buf.
+        rew_buf, is_success = super().compute_kuka_reward()
 
         wrist_pos_rew, wrist_rot_rew, fingertip_rew = self._hand_pose_reward()
         hand_extra = (
@@ -219,7 +272,7 @@ class VideoRLFollower(SimToolReal):
             + self.w_wrist_rot * wrist_rot_rew
             + self.w_fingertip * fingertip_rew
         )
-        self.rew_buf[:] = self.rew_buf + hand_extra
+        self.rew_buf[:] = rew_buf + hand_extra
 
         # Bookkeeping for logs
         if "raw_wrist_pos_rew" not in self.rewards_episode:
@@ -236,7 +289,7 @@ class VideoRLFollower(SimToolReal):
         self.rewards_episode["raw_wrist_rot_rew"] += wrist_rot_rew
         self.rewards_episode["raw_fingertip_rew"] += fingertip_rew
 
-        return self.rew_buf, self.reset_buf
+        return self.rew_buf, is_success
 
     # ------------------------------------------------------------------
     # Observation hook
@@ -247,14 +300,15 @@ class VideoRLFollower(SimToolReal):
         if not self.expose_hand_goal_to_policy:
             return
 
-        # Compose hand-goal observation: wrist goal (7) + fingertip goal (K*3)
         wrist_goal = self._wrist_goal                                 # (N, 7)
         ftip_goal = self._fingertip_goal_local.reshape(self.num_envs, -1)  # (N, K*3)
+        hand_goal = torch.cat([wrist_goal, ftip_goal], dim=-1)        # (N, 7+K*3)
 
-        hand_goal_obs = torch.cat([wrist_goal, ftip_goal], dim=-1)
-        # Append to obs_buf and states_buf so policy and critic both see it.
-        self.obs_buf = torch.cat([self.obs_buf, hand_goal_obs], dim=-1)
-        self.states_buf = torch.cat([self.states_buf, hand_goal_obs], dim=-1)
+        # Concatenate to obs_buf and states_buf.  The space sizes were already
+        # bumped in __init__, so rl_games's network heads agree with these
+        # shapes.
+        self.obs_buf = torch.cat([self.obs_buf, hand_goal], dim=-1)
+        self.states_buf = torch.cat([self.states_buf, hand_goal], dim=-1)
 
     # ------------------------------------------------------------------
     # Properties for downstream code

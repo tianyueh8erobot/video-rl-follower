@@ -1,8 +1,9 @@
 """DAPG-augmented PPO agent for rl_games.
 
 Implements *Demo Augmented Policy Gradient* (Rajeswaran et al. 2017) on top of
-rl_games' :class:`A2CAgent`.  At every PPO mini-batch update we add an
-auxiliary behaviour-cloning loss on a fixed expert dataset:
+rl_games' :class:`A2CAgent`.  The standard PPO loss is augmented with a
+behaviour-cloning term computed on a fixed expert dataset, and both terms are
+backpropagated in a *single* gradient step:
 
 .. math::
 
@@ -26,13 +27,18 @@ populating ``params.config.dapg.demo_path``.
 
 This file registers the algo via ``register()``; ``isaacgymenvs/__init__.py``
 calls it on import so ``rl_games.torch_runner.Runner`` can find the builder.
+
+Notes on RNN handling.  The default LSTM-Asymmetric config trains a recurrent
+policy.  Because the BC samples are i.i.d. transitions (no temporal structure
+implied), we always evaluate the BC loss with ``seq_length = 1`` and a fresh
+zeroed RNN state.  This keeps the auxiliary loss well-defined and avoids
+hidden-state leakage across unrelated demos.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -48,12 +54,13 @@ except Exception:  # pragma: no cover — optional at import time
 
 
 class _DemoBuffer:
-    """In-memory expert dataset; samples uniform mini-batches without replacement."""
+    """In-memory expert dataset; samples uniform mini-batches with replacement."""
 
     def __init__(self, observations: Tensor, actions: Tensor, device: str | torch.device):
-        assert observations.shape[0] == actions.shape[0], (
-            f"demo length mismatch: obs={observations.shape[0]} acts={actions.shape[0]}"
-        )
+        if observations.shape[0] != actions.shape[0]:
+            raise ValueError(
+                f"demo length mismatch: obs={observations.shape[0]} acts={actions.shape[0]}"
+            )
         self._obs = observations.to(device).float()
         self._acts = actions.to(device).float()
         self._n = self._obs.shape[0]
@@ -111,10 +118,17 @@ class DAPGAgent(A2CAgent):
         # Diagnostics
         self._bc_loss_running = 0.0
         self._bc_loss_running_count = 0
+        self._epoch_lambda_used = self._lambda
 
     # ------------------------------------------------------------------
     def _bc_loss(self) -> Tensor:
-        """Behaviour-cloning loss on a fresh demo mini-batch."""
+        """Behaviour-cloning loss on a fresh demo mini-batch.
+
+        Demos are treated as i.i.d. transitions; under an LSTM policy we still
+        evaluate ``seq_length=1`` with a zero-initialised hidden state so that
+        each demo example is scored independently — this avoids hidden-state
+        leakage between unrelated transitions.
+        """
         obs_e, act_e = self._demo_buffer.sample(self._demo_batch_size)
         obs_e = self._preproc_obs(obs_e)
         batch_dict = {
@@ -123,71 +137,199 @@ class DAPGAgent(A2CAgent):
             "obs": obs_e,
         }
         if self.is_rnn:
-            # Demos are treated as i.i.d. transitions: zero-init the RNN.
-            seq_len = max(1, self.seq_length)
             n = obs_e.shape[0]
-            # Pad the demo batch to a multiple of seq_len so the LSTM unroll
-            # works.  We chop off any remainder — fine for a stochastic loss.
-            nb = (n // seq_len) * seq_len
-            if nb == 0:
-                return torch.zeros((), device=self.ppo_device)
-            obs_e = obs_e[:nb]
-            act_e = act_e[:nb]
-            batch_dict["obs"] = obs_e
-            batch_dict["prev_actions"] = act_e
-            batch_dict["seq_length"] = seq_len
-            batch_dict["rnn_states"] = [
-                torch.zeros(
-                    rs.shape[0], nb // seq_len, rs.shape[2], device=self.ppo_device
+            batch_dict["seq_length"] = 1
+            # rnn_states layout in rl_games: list of tensors with shape
+            # (num_layers, n_seq, hidden); each step contains seq_length frames
+            # so n_seq = n // seq_length = n.
+            try:
+                template_states = self.rnn_states  # type: ignore[attr-defined]
+            except AttributeError:
+                template_states = None
+            if template_states is not None:
+                batch_dict["rnn_states"] = [
+                    torch.zeros(
+                        rs.shape[0], n, rs.shape[2],
+                        device=self.ppo_device, dtype=rs.dtype,
+                    )
+                    for rs in template_states
+                ]
+            # ``zero_rnn_on_done`` requires a dones tensor; provide a dummy.
+            if getattr(self, "zero_rnn_on_done", False):
+                batch_dict["dones"] = torch.zeros(
+                    n, device=self.ppo_device, dtype=torch.bool
                 )
-                for rs in self.rnn_states
-            ] if hasattr(self, "rnn_states") and self.rnn_states is not None else None
-            # If the policy stores per-step RNN states differently, the user
-            # can supply a smaller seq_length via mini_epochs config to stay
-            # safe.  We intentionally keep this minimal.
-        with torch.cuda.amp.autocast(enabled=self.mixed_precision):
-            res = self.model(batch_dict)
-            # ``prev_neglogp`` is the negative log prob of the *teacher* action
-            # under the current policy — exactly what BC wants to minimise.
-            neglogp = res["prev_neglogp"]
-            return neglogp.mean()
+
+        res = self.model(batch_dict)
+        # ``prev_neglogp`` is the negative log prob of the *teacher* action
+        # under the current policy — exactly what BC wants to minimise.
+        return res["prev_neglogp"].mean()
 
     # ------------------------------------------------------------------
     def calc_gradients(self, input_dict):
-        # First run the standard PPO gradient computation; this populates
-        # self.train_result with (a_loss, c_loss, ...).  We then take an extra
-        # backward+step on the BC loss multiplied by lambda.
-        super().calc_gradients(input_dict)
+        # Straight-line port of the parent's PPO loss assembly with one extra
+        # additive term: ``+ λ * BC``.  We intentionally re-implement the
+        # body so that the combined loss is back-propagated in a single
+        # ``self.scaler.scale(loss).backward()`` call rather than two.
+        value_preds_batch = input_dict["old_values"]
+        old_action_log_probs_batch = input_dict["old_logp_actions"]
+        advantage = input_dict["advantages"]
+        old_mu_batch = input_dict["mu"]
+        old_sigma_batch = input_dict["sigma"]
+        return_batch = input_dict["returns"]
+        actions_batch = input_dict["actions"]
+        obs_batch = input_dict["obs"]
+        obs_batch = self._preproc_obs(obs_batch)
 
-        if self._lambda <= 0.0:
-            return
+        lr_mul = 1.0
+        curr_e_clip = self.e_clip
 
-        bc_loss = self._bc_loss()
-        if not torch.isfinite(bc_loss):
-            return  # skip pathological mini-batches silently
+        batch_dict = {
+            "is_train": True,
+            "prev_actions": actions_batch,
+            "obs": obs_batch,
+        }
+        rnn_masks = None
+        if self.is_rnn:
+            rnn_masks = input_dict["rnn_masks"]
+            batch_dict["rnn_states"] = input_dict["rnn_states"]
+            batch_dict["seq_length"] = self.seq_length
+            if getattr(self, "zero_rnn_on_done", False):
+                batch_dict["dones"] = input_dict["dones"]
 
-        scaled = self._lambda * bc_loss
-        for p in self.model.parameters():
-            p.grad = None
-        self.scaler.scale(scaled).backward()
-        # Reuse rl_games' gradient clipping/optimiser helper.
-        self.trancate_gradients_and_step()
+        with torch.cuda.amp.autocast(enabled=self.mixed_precision):
+            res_dict = self.model(batch_dict)
+            action_log_probs = res_dict["prev_neglogp"]
+            values = res_dict["values"]
+            entropy = res_dict["entropy"]
+            mu = res_dict["mus"]
+            sigma = res_dict["sigmas"]
 
+            a_loss = self.actor_loss_func(
+                old_action_log_probs_batch, action_log_probs, advantage,
+                self.ppo, curr_e_clip,
+            )
+            if self.has_value_loss:
+                c_loss = common_losses.critic_loss(
+                    self.model, value_preds_batch, values, curr_e_clip,
+                    return_batch, self.clip_value,
+                )
+            else:
+                c_loss = torch.zeros((len(values), 1), device=self.ppo_device)
+            if self.bound_loss_type == "regularisation":
+                b_loss = self.reg_loss(mu)
+            elif self.bound_loss_type == "bound":
+                b_loss = self.bound_loss(mu)
+            else:
+                b_loss = torch.zeros(len(mu), device=self.ppo_device)
+
+            entropy_coef = self.entropy_coef
+
+            losses, sum_mask = torch_ext.apply_masks(
+                [
+                    a_loss.unsqueeze(1),
+                    c_loss,
+                    (entropy_coef * entropy).unsqueeze(1),
+                    b_loss.unsqueeze(1),
+                ],
+                rnn_masks,
+            )
+            a_loss, c_loss, entropy_loss, b_loss = (
+                losses[0], losses[1], losses[2], losses[3],
+            )
+
+            ppo_loss = (
+                a_loss
+                + 0.5 * c_loss * self.critic_coef
+                - entropy_loss
+                + b_loss * self.bounds_loss_coef
+            )
+
+            # Auxiliary BC term — always evaluated even if lambda is 0 so the
+            # loss graph stays stable; the scalar lambda multiplier zeros out
+            # the contribution if requested.
+            if self._lambda > 0.0:
+                bc_loss = self._bc_loss()
+                if not torch.isfinite(bc_loss):
+                    bc_loss = torch.zeros((), device=self.ppo_device)
+            else:
+                bc_loss = torch.zeros((), device=self.ppo_device)
+
+            loss = ppo_loss + self._lambda * bc_loss
+
+            if self.multi_gpu:
+                self.optimizer.zero_grad()
+            else:
+                for param in self.model.parameters():
+                    param.grad = None
+
+        self.scaler.scale(loss).backward()
+        all_grads = self.trancate_gradients_and_step()
+
+        with torch.no_grad():
+            reduce_kl = rnn_masks is None
+            kl_dist = torch_ext.policy_kl(
+                mu.detach(), sigma.detach(),
+                old_mu_batch, old_sigma_batch, reduce_kl,
+            )
+            if rnn_masks is not None:
+                kl_dist = (kl_dist * rnn_masks).sum() / rnn_masks.numel()
+
+        self.diagnostics.mini_batch(
+            self,
+            {
+                "values": value_preds_batch,
+                "returns": return_batch,
+                "new_neglogp": action_log_probs,
+                "old_neglogp": old_action_log_probs_batch,
+                "masks": rnn_masks,
+            },
+            curr_e_clip,
+            0,
+        )
+
+        # Track BC loss for end-of-epoch reporting.
         self._bc_loss_running += float(bc_loss.detach().cpu())
         self._bc_loss_running_count += 1
+
+        ratio = torch.exp(old_action_log_probs_batch - action_log_probs)
+        contrib = torch.logical_and(
+            ratio < 1.0 + curr_e_clip, ratio > 1.0 - curr_e_clip
+        ).float()
+        extras = {
+            "on_policy_contrib": contrib.mean().item(),
+            "off_policy_contrib": 0,
+            "on_policy_grads": all_grads.detach().cpu(),
+            "off_policy_grads": torch.zeros_like(all_grads).cpu(),
+        }
+
+        self.train_result = (
+            a_loss, c_loss,
+            torch_ext.apply_masks([entropy.unsqueeze(1)], rnn_masks)[0][0],
+            kl_dist, self.last_lr, lr_mul,
+            mu.detach(), sigma.detach(), b_loss, extras,
+        )
 
     # ------------------------------------------------------------------
     def update_epoch(self):
         ep = super().update_epoch()
-        # Decay lambda once per PPO epoch.
-        self._lambda *= self._lambda_decay
-        # Log running BC loss to extras (TensorBoard).
+        # Decay AFTER the just-finished epoch so that ``self._lambda`` during
+        # epoch N matches ``lambda_init * decay**N`` (epoch 0 sees lambda_init).
+        # Push aggregated BC stats to TensorBoard via the same writer rl_games
+        # uses for episode metrics.
         if self._bc_loss_running_count > 0:
             avg = self._bc_loss_running / self._bc_loss_running_count
-            self.diagnostics.epoch(self, "dapg/bc_loss", avg)
-            self.diagnostics.epoch(self, "dapg/lambda", self._lambda)
+            writer = getattr(self, "writer", None)
+            if writer is not None:
+                writer.add_scalar("dapg/bc_loss", avg, ep)
+                writer.add_scalar("dapg/lambda", self._epoch_lambda_used, ep)
             self._bc_loss_running = 0.0
             self._bc_loss_running_count = 0
+
+        # Step lambda for the NEXT epoch and remember the value used so it
+        # appears correctly in the next round of logging.
+        self._epoch_lambda_used = self._lambda
+        self._lambda *= self._lambda_decay
         return ep
 
 
@@ -195,9 +337,6 @@ def register() -> None:
     """Register the DAPG agent with rl_games' algo factory."""
     if not _RL_GAMES_AVAILABLE:
         return
-    # Hook into the singleton Runner so that
-    # `Runner().algo_factory.create('dapg', ...)` works.  We patch the class
-    # method in __init__ so it's idempotent.
     _orig_init = Runner.__init__
 
     def patched_init(self, *args, **kwargs):
