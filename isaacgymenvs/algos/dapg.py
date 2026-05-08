@@ -118,7 +118,6 @@ class DAPGAgent(A2CAgent):
         # Diagnostics
         self._bc_loss_running = 0.0
         self._bc_loss_running_count = 0
-        self._epoch_lambda_used = self._lambda
 
     # ------------------------------------------------------------------
     def _bc_loss(self) -> Tensor:
@@ -311,26 +310,44 @@ class DAPGAgent(A2CAgent):
         )
 
     # ------------------------------------------------------------------
-    def update_epoch(self):
-        ep = super().update_epoch()
-        # Decay AFTER the just-finished epoch so that ``self._lambda`` during
-        # epoch N matches ``lambda_init * decay**N`` (epoch 0 sees lambda_init).
-        # Push aggregated BC stats to TensorBoard via the same writer rl_games
-        # uses for episode metrics.
-        if self._bc_loss_running_count > 0:
-            avg = self._bc_loss_running / self._bc_loss_running_count
-            writer = getattr(self, "writer", None)
-            if writer is not None:
-                writer.add_scalar("dapg/bc_loss", avg, ep)
-                writer.add_scalar("dapg/lambda", self._epoch_lambda_used, ep)
-            self._bc_loss_running = 0.0
-            self._bc_loss_running_count = 0
+    def train_epoch(self):
+        """Run one PPO epoch then decay lambda.
 
-        # Step lambda for the NEXT epoch and remember the value used so it
-        # appears correctly in the next round of logging.
-        self._epoch_lambda_used = self._lambda
+        rl_games' control flow is::
+
+            while True:
+                self.update_epoch()    # increments epoch counter
+                self.train_epoch()     # consumes self._lambda inside calc_gradients
+
+        Doing the decay inside ``update_epoch()`` would mean the very first
+        training epoch consumes ``lambda_init * lambda_decay`` instead of
+        ``lambda_init``.  We therefore tie the decay to the END of
+        ``train_epoch`` so that:
+
+          * epoch 0 sees ``lambda_init`` (correct);
+          * the value logged for epoch N is the value actually used in epoch N.
+        """
+        # Snapshot the lambda value about to be consumed for clean logging.
+        epoch_lambda = self._lambda
+        # Reset the per-epoch BC accumulators before the parent calls
+        # calc_gradients repeatedly.
+        self._bc_loss_running = 0.0
+        self._bc_loss_running_count = 0
+
+        result = super().train_epoch()
+
+        # Log
+        writer = getattr(self, "writer", None)
+        if writer is not None:
+            current_epoch = getattr(self, "epoch_num", 0)
+            if self._bc_loss_running_count > 0:
+                avg = self._bc_loss_running / self._bc_loss_running_count
+                writer.add_scalar("dapg/bc_loss", avg, current_epoch)
+            writer.add_scalar("dapg/lambda", epoch_lambda, current_epoch)
+
+        # Decay AFTER use so the next train_epoch sees the decayed value.
         self._lambda *= self._lambda_decay
-        return ep
+        return result
 
 
 def register() -> None:

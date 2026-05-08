@@ -154,6 +154,15 @@ Defaults: `wristPos=1.0, wristRot=0.5, fingertip=2.0`.
   approximates the wrist position via `data["rhand_transl"]` from the GRAB
   demo, which is close but not identical to ManipTrans's
   `j0 - 0.25*(j4 - j0)` shift.
+* **Palm-center vs wrist origin**: SimToolReal's `fingertip_pos_rel_palm`
+  is computed against `palm_center_pos`, which is the palm body position
+  PLUS an offset (the "grip center").  The trajectory exporter currently
+  expresses `wrist_goals` and `fingertip_local` relative to the MANO wrist
+  joint (or `rhand_transl`), not the palm-center proxy.  This introduces a
+  small constant translation bias in the wrist-position and fingertip-local
+  rewards.  When you have a matching Sharpa hand mesh, the cleanest fix is
+  to pick a hand-relative origin (e.g. middle MCP joint for the goal side
+  and a measured offset for the env side) and align both before training.
 * DAPG demo collection is **not** automated.  Provide your own .pt file or
   write a small `tools/collect_demo.py` that runs an oracle policy and dumps
   `(obs, action)` pairs.

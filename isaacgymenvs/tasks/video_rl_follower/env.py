@@ -139,9 +139,16 @@ class VideoRLFollower(SimToolReal):
     # ------------------------------------------------------------------
 
     def _extend_obs_state_spaces(self) -> None:
-        """Extend gym observation_space, state_space and the obs delay queue
-        to account for the hand-goal channels appended in
+        """Extend gym observation_space, state_space and obs/state buffers to
+        account for the hand-goal channels appended in
         ``populate_obs_and_states_buffers``.
+
+        The base ``obs_queue`` is INTENTIONALLY left at its original width.
+        Hand-goal channels are not subjected to the action-loop observation
+        delay simulation (goals are control inputs, not noisy sensor reads),
+        so they are appended **after** the base class's delay sampling step.
+        Widening the queue would also break ``update_queue``'s shape assertion
+        which compares ``current_values.shape[-1]`` against ``queue.shape[-1]``.
         """
         extra = self.hand_goal_obs_dim                           # 7 + K*3
 
@@ -158,21 +165,10 @@ class VideoRLFollower(SimToolReal):
             np.ones(new_state_size) * -np.inf,
             np.ones(new_state_size) * np.inf,
         )
-        # Mirror back to cfg so any downstream readers (e.g., logging) agree.
         self.cfg["env"]["numObservations"] = new_obs_size
         self.cfg["env"]["numStates"] = new_state_size
 
-        # 2) obs delay queue — base class allocates it to (N, L, num_obs).
-        if hasattr(self, "obs_queue"):
-            old = self.obs_queue
-            new = torch.zeros(
-                old.shape[0], old.shape[1], new_obs_size,
-                dtype=old.dtype, device=old.device,
-            )
-            new[..., : old.shape[-1]] = old
-            self.obs_queue = new
-
-        # 3) re-allocate obs_buf and states_buf so rl_games sees the right
+        # 2) re-allocate obs_buf and states_buf so rl_games sees the right
         #    shape on the very first ``reset()`` (before any compute step).
         self.obs_buf = torch.zeros(
             self.num_envs, new_obs_size, dtype=torch.float32, device=self.device
@@ -217,13 +213,20 @@ class VideoRLFollower(SimToolReal):
     # ------------------------------------------------------------------
 
     def _current_fingertips_in_wrist_local(self) -> Tensor:
-        """Return current fingertip positions expressed in the wrist-local frame.
+        """Return current fingertip positions expressed in the palm-center
+        rotated frame, which is the SAME convention the env uses elsewhere
+        (`fingertip_pos_rel_palm` is computed against ``palm_center_pos``,
+        not against the wrist link).
 
-        SimToolReal exposes ``self.fingertip_pos_rel_palm`` (palm-relative in
-        *world* axes) and ``self._palm_state[:, 3:7]`` (palm rotation, xyzw).
-        We rotate that offset by the inverse palm orientation to get a frame
-        that matches the ``fingertip_local`` channels stored in the trajectory
-        file.
+        IMPORTANT alignment requirement: the trajectory file's
+        ``fingertip_local`` field MUST be expressed in this same frame.  In
+        practice that means the trajectory pipeline should compute the local
+        offsets relative to the **palm-center proxy** (e.g. middle MCP joint)
+        rather than the MANO wrist joint.  The trajectory exporter currently
+        approximates the wrist origin via ``rhand_transl``; this introduces a
+        small constant translation bias relative to palm-center.  Document
+        this as a known limitation; it may be tightened later by fitting a
+        wrist→palm-center offset on real Sharpa hand data.
         """
         offsets_world = self.fingertip_pos_rel_palm                 # (N, K, 3)
         palm_quat = self._palm_state[:, 3:7]                        # (N, 4)
@@ -236,14 +239,21 @@ class VideoRLFollower(SimToolReal):
     # ------------------------------------------------------------------
 
     def _hand_pose_reward(self) -> Tuple[Tensor, Tensor, Tensor]:
-        """Compute three hand-pose reward terms, each in [0, 1] before scaling."""
-        # 1) wrist position
-        wrist_pos_curr = self._palm_state[:, :3]
+        """Compute three hand-pose reward terms, each in [0, 1] before scaling.
+
+        The "wrist" position is taken to be ``palm_center_pos`` (i.e. the same
+        origin as ``fingertip_pos_rel_palm``).  The trajectory file should
+        emit ``wrist_goals`` in the matching convention; see the comment in
+        ``_current_fingertips_in_wrist_local``.
+        """
+        # 1) wrist position (palm-center convention)
+        wrist_pos_curr = self.palm_center_pos
         wrist_pos_goal = self._wrist_goal[:, :3]
         d_pos = torch.norm(wrist_pos_curr - wrist_pos_goal, dim=-1)
         wrist_pos_rew = torch.exp(-self.lambda_wrist_pos * d_pos)
 
-        # 2) wrist rotation (geodesic angle)
+        # 2) wrist rotation (geodesic angle); palm body rotation is what
+        #    drives the end-effector frame in SimToolReal.
         wrist_quat_curr = self._palm_state[:, 3:7]
         wrist_quat_goal = self._wrist_goal[:, 3:7]
         ang = _quat_geodesic_angle_xyzw(wrist_quat_curr, wrist_quat_goal)
