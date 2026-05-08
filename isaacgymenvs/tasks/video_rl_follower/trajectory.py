@@ -158,6 +158,19 @@ class ReferenceTrajectory:
                 raise ValueError(
                     f"object.grasp_bbox_scale must have 3 entries, got {len(grasp_bbox)}"
                 )
+            try:
+                grasp_bbox = tuple(float(v) for v in grasp_bbox)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"object.grasp_bbox_scale entries must be numeric, got {grasp_bbox!r}"
+                ) from exc
+            import math
+            for v in grasp_bbox:
+                if not math.isfinite(v) or v <= 0.0:
+                    raise ValueError(
+                        "object.grasp_bbox_scale entries must be finite and "
+                        f"strictly positive, got {grasp_bbox}"
+                    )
 
         return cls(
             meta=d.get("meta", {}),

@@ -111,7 +111,16 @@ class VideoRLFollower(SimToolReal):
         ]
         cfg["env"]["maxConsecutiveSuccesses"] = self._trajectory.num_goals
 
-        # ----- Trajectory-driven object asset & start pose -----
+        # ----- Trajectory-driven object start pose (always honoured) -----
+        # The trajectory's first object pose is the intended initial state of
+        # the manipulated object, irrespective of whether we load its URDF or
+        # fall back to procedural primitives.  Set this BEFORE super().__init__
+        # so the base ``_object_start_pose`` honours it.
+        cfg["env"]["objectStartPose"] = list(
+            self._trajectory.object_start_pose.tolist()
+        )
+
+        # ----- Trajectory-driven object asset (URDF) selection -----
         self._use_trajectory_object = bool(
             cfg["env"].get("useTrajectoryObject", True)
         ) and self._trajectory.object_urdf_path is not None
@@ -131,11 +140,6 @@ class VideoRLFollower(SimToolReal):
             # Pin objectName to a sentinel so the base method falls into our
             # subclass override branch instead of NAME_TO_OBJECT lookup.
             cfg["env"]["objectName"] = "video_rl_follower_trajectory_object"
-            # Wire start pose for the object spawn (handled by the base via
-            # cfg["env"]["objectStartPose"]).
-            cfg["env"]["objectStartPose"] = list(
-                self._trajectory.object_start_pose.tolist()
-            )
 
         super().__init__(cfg, *args, **kwargs)
 
@@ -222,10 +226,22 @@ class VideoRLFollower(SimToolReal):
             )
 
         object_asset_files = [self._trajectory_object_urdf_abs]
-        # ``object.scale`` here means the **grasp bounding box** in metres
-        # (used by SimToolReal to size keypoint offsets), NOT mesh scale.
-        # Mesh scale is baked into the URDF / mesh file itself.
-        object_asset_scales = [self._trajectory.object_grasp_bbox_scale]
+
+        # The base ``object_asset_scales`` contract is normalised by
+        # ``object_base_size``: ``_handle_head_primitives`` returns scales as
+        # ``(x / object_base_size, y / object_base_size, z / object_base_size)``
+        # (env.py L1740-1747) and the keypoint code multiplies them back by
+        # ``object_base_size`` (L2091-2092).  We therefore need to do the same
+        # division to keep the geometric scale correct.  The trajectory JSON
+        # stores the grasp bbox in **metres** for human readability.
+        bbox_m = self._trajectory.object_grasp_bbox_scale            # (m, m, m)
+        base = float(self.object_base_size)
+        if base <= 0.0:
+            raise ValueError(
+                f"objectBaseSize must be > 0, got {base}"
+            )
+        normalised = (bbox_m[0] / base, bbox_m[1] / base, bbox_m[2] / base)
+        object_asset_scales = [normalised]
         need_vhacds = [self._trajectory.object_need_vhacd]
 
         # Replicate the base's useFixedGoalStates → trajectory_states wiring.
