@@ -111,6 +111,32 @@ class VideoRLFollower(SimToolReal):
         ]
         cfg["env"]["maxConsecutiveSuccesses"] = self._trajectory.num_goals
 
+        # ----- Trajectory-driven object asset & start pose -----
+        self._use_trajectory_object = bool(
+            cfg["env"].get("useTrajectoryObject", True)
+        ) and self._trajectory.object_urdf_path is not None
+        if self._use_trajectory_object:
+            urdf = self._trajectory.object_urdf_path
+            if not os.path.isabs(urdf):
+                project_root = Path(__file__).resolve().parents[3]
+                urdf = str(project_root / urdf)
+            if not os.path.isfile(urdf):
+                raise FileNotFoundError(
+                    f"Trajectory points at object URDF '{urdf}' but it doesn't "
+                    "exist on disk.  Either update the trajectory's "
+                    "object.urdf_path or download the corresponding ManipTrans "
+                    "demo data (see ManipTrans README §Prerequisites)."
+                )
+            self._trajectory_object_urdf_abs = urdf
+            # Pin objectName to a sentinel so the base method falls into our
+            # subclass override branch instead of NAME_TO_OBJECT lookup.
+            cfg["env"]["objectName"] = "video_rl_follower_trajectory_object"
+            # Wire start pose for the object spawn (handled by the base via
+            # cfg["env"]["objectStartPose"]).
+            cfg["env"]["objectStartPose"] = list(
+                self._trajectory.object_start_pose.tolist()
+            )
+
         super().__init__(cfg, *args, **kwargs)
 
         # ----- Move trajectory to env device, install dense state tensor -----
@@ -176,6 +202,49 @@ class VideoRLFollower(SimToolReal):
         self.states_buf = torch.zeros(
             self.num_envs, new_state_size, dtype=torch.float32, device=self.device
         )
+
+    # ------------------------------------------------------------------
+    # Object asset (URDF) selection
+    # ------------------------------------------------------------------
+
+    def _main_object_assets_and_scales(self, object_asset_root, tmp_assets_dir):
+        """If the trajectory specifies a URDF, return that single asset and
+        skip SimToolReal's procedural primitive generation entirely.
+
+        We still honour the base ``useFixedGoalStates`` block by inlining its
+        ``trajectory_states`` write here — we cannot call ``super()`` cleanly
+        because the base method's ``object_name`` branch would raise on our
+        sentinel name.
+        """
+        if not self._use_trajectory_object:
+            return super()._main_object_assets_and_scales(
+                object_asset_root, tmp_assets_dir
+            )
+
+        object_asset_files = [self._trajectory_object_urdf_abs]
+        # ``object.scale`` here means the **grasp bounding box** in metres
+        # (used by SimToolReal to size keypoint offsets), NOT mesh scale.
+        # Mesh scale is baked into the URDF / mesh file itself.
+        object_asset_scales = [self._trajectory.object_grasp_bbox_scale]
+        need_vhacds = [self._trajectory.object_need_vhacd]
+
+        # Replicate the base's useFixedGoalStates → trajectory_states wiring.
+        if self.cfg["env"]["useFixedGoalStates"]:
+            fixed = self.cfg["env"].get("fixedGoalStates")
+            fixed_path = self.cfg["env"].get("fixedGoalStatesJsonPath")
+            if fixed is not None:
+                self.trajectory_states = torch.tensor(
+                    fixed, device=self.device
+                )
+            elif fixed_path is not None:
+                with open(fixed_path, "r") as f:
+                    import json as _json
+                    self.trajectory_states = torch.tensor(
+                        _json.load(f)["goals"], device=self.device
+                    )
+            self.max_consecutive_successes = len(self.trajectory_states)
+
+        return object_asset_files, object_asset_scales, need_vhacds
 
     # ------------------------------------------------------------------
     # Trajectory-aware goal handling

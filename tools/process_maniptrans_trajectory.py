@@ -241,11 +241,28 @@ def _downsample(traj: dict, src_fps: float, target_fps: float) -> dict:
     )
 
 
-def _to_json(traj: dict, *, src: str, fps: float, urdf_path: str | None) -> dict:
+def _to_json(
+    traj: dict,
+    *,
+    src: str,
+    fps: float,
+    urdf_path: str | None,
+    grasp_bbox_scale: tuple[float, float, float] | None = None,
+    need_vhacd: bool = False,
+) -> dict:
     obj_pose = traj["object_pose"]                         # (T, 7)
     wrist_pos = traj["wrist_pos"]                          # (T, 3)
     wrist_quat = traj["wrist_quat"]                        # (T, 4)
     wrist_pose = np.concatenate([wrist_pos, wrist_quat], axis=-1)   # (T, 7)
+    obj_block = {
+        "urdf_path": urdf_path,
+        "scale": 1.0,
+        "start_pose": obj_pose[0].tolist(),
+        "goals": obj_pose.tolist(),
+        "need_vhacd": bool(need_vhacd),
+    }
+    if grasp_bbox_scale is not None:
+        obj_block["grasp_bbox_scale"] = list(grasp_bbox_scale)
     return {
         "meta": {
             "source": src,
@@ -255,12 +272,7 @@ def _to_json(traj: dict, *, src: str, fps: float, urdf_path: str | None) -> dict
             "wrist_pose_format": "[x, y, z, qx, qy, qz, qw]",
             "object_pose_format": "[x, y, z, qx, qy, qz, qw]",
         },
-        "object": {
-            "urdf_path": urdf_path,
-            "scale": 1.0,
-            "start_pose": obj_pose[0].tolist(),
-            "goals": obj_pose.tolist(),
-        },
+        "object": obj_block,
         "hand": {
             "wrist_goals": wrist_pose.tolist(),
             "fingertip_goals": traj["fingertips_w"].tolist(),
@@ -346,7 +358,10 @@ def main() -> int:
 
     if args.mock:
         full = _mock_trajectory()
-        urdf = "assets/urdf/dextoolbench/handle_head_primitives/object_001.urdf"
+        # mock trajectory has no real URDF; leave urdf_path null so the env
+        # falls back to procedural primitives.
+        urdf = None
+        bbox = (0.05, 0.05, 0.05)
         src = "mock/cylinder_rotation"
     else:
         data = _load_grab_demo(Path(args.maniptrans_root), args.data_idx)
@@ -354,10 +369,20 @@ def main() -> int:
         urdf = str(
             Path(args.maniptrans_root) / "data" / "grab_demo" / "102" / "102_obj.urdf"
         )
+        # GRAB g0 is a teapot mesh — a sensible default grasp bbox is ~0.10 m
+        # along the long axis.  User can override post-hoc by editing the JSON.
+        bbox = (0.10, 0.05, 0.05)
         src = f"ManipTrans/grab_demo/{args.data_idx}"
 
     sub = _downsample(full, args.src_fps, args.target_fps)
-    j = _to_json(sub, src=src, fps=args.target_fps, urdf_path=urdf)
+    j = _to_json(
+        sub,
+        src=src,
+        fps=args.target_fps,
+        urdf_path=urdf,
+        grasp_bbox_scale=bbox,
+        need_vhacd=False if args.mock else True,
+    )
     with open(out_path, "w") as f:
         json.dump(j, f, indent=2)
 

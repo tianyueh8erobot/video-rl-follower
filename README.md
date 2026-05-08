@@ -68,18 +68,42 @@ pip install -e .
 
 ### 1) Process a ManipTrans demo into a trajectory
 
+You first need the upstream ManipTrans GRAB demo data on disk:
+
 ```bash
-# With ManipTrans data on disk:
+# 1. Clone ManipTrans (one-time)
+git clone https://github.com/ManipTrans/ManipTrans /home/intel/Codes/ManipTrans
+
+# 2. Download the GRAB demo from
+#    https://1drv.ms/f/s!AgSPtac7QUbHgVE5vMBOAUPzxxsV
+#    (linked from ManipTrans README §Prerequisites)
+# 3. Extract under
+#    /home/intel/Codes/ManipTrans/data/grab_demo/102/
+#    so that data/grab_demo/102/102_sv_dict.npy and 102_obj.obj exist.
+# 4. Copy the example URDF:
+cp /home/intel/Codes/ManipTrans/assets/obj_urdf_example.urdf \
+   /home/intel/Codes/ManipTrans/data/grab_demo/102/102_obj.urdf
+```
+
+Then convert to a 3 Hz JSON the env can consume:
+
+```bash
+# With ManipTrans data on disk → produces a real teapot trajectory + URDF link:
 python tools/process_maniptrans_trajectory.py \
     --maniptrans-root /home/intel/Codes/ManipTrans \
     --data-idx g0 \
     --src-fps 60 --target-fps 3 \
     --out data/trajectories/g0.json
 
-# Without ManipTrans data (smoke test):
+# Without ManipTrans data (smoke test, no real URDF):
 python tools/process_maniptrans_trajectory.py \
     --mock --out data/trajectories/example_g0.json
 ```
+
+> The env reads ``object.urdf_path`` from the JSON.  When it is set (real-data
+> case), the env spawns that exact ManipTrans object and uses
+> ``object.start_pose`` as the initial pose.  When it is null (mock case),
+> the env falls back to SimToolReal's procedural primitives.
 
 ### 2) Visualise the cleaned trajectory
 
@@ -146,10 +170,6 @@ Defaults: `wristPos=1.0, wristRot=0.5, fingertip=2.0`.
 
 ## Limitations / known gaps
 
-* Object asset loading still goes through SimToolReal's procedural primitive
-  generator unless you also adapt `_load_main_object_asset` to honour
-  `trajectory.object.urdf_path`.  The generated trajectory's `object.urdf_path`
-  is currently informational only.
 * MANO joint regressor isn't redistributed here; the trajectory pipeline
   approximates the wrist position via `data["rhand_transl"]` from the GRAB
   demo, which is close but not identical to ManipTrans's

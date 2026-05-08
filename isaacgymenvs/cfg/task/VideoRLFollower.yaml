@@ -11,6 +11,12 @@ env:
   # Resolved relative to the project root if not absolute.
   trajectoryPath: data/trajectories/example_g0.json
 
+  # If True, spawn the object whose URDF the trajectory specifies (and use
+  # trajectory.object.start_pose as the initial pose).  If the trajectory has
+  # no urdf_path, this flag is silently ignored and we fall back to the base
+  # SimToolReal asset path (controlled by ``objectName``).
+  useTrajectoryObject: True
+
   # Reward weights for the hand-pose follow-up (added on top of object reward)
   handPoseRewardScale:
     wristPos: 1.0

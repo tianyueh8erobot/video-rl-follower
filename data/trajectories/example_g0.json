@@ -14,7 +14,7 @@
     "object_pose_format": "[x, y, z, qx, qy, qz, qw]"
   },
   "object": {
-    "urdf_path": "assets/urdf/dextoolbench/handle_head_primitives/object_001.urdf",
+    "urdf_path": null,
     "scale": 1.0,
     "start_pose": [
       0.5,
@@ -350,6 +350,12 @@
         0.08292311434513765,
         -0.9965559478058937
       ]
+    ],
+    "need_vhacd": false,
+    "grasp_bbox_scale": [
+      0.05,
+      0.05,
+      0.05
     ]
   },
   "hand": {

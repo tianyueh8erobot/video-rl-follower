@@ -11,14 +11,18 @@ A trajectory file is a JSON with this schema (see tools/process_maniptrans_traje
     },
     "object": {
         "urdf_path": "data/objects/102/102_obj.urdf",
-        "scale": 1.0,
+        "scale": 1.0,                                     # uniform mesh scale
+        "grasp_bbox_scale": [0.10, 0.05, 0.05],           # OPTIONAL: dx, dy, dz of grasp bbox
+                                                          #   used by the env's keypoint reward.
+                                                          #   Defaults to [0.06, 0.06, 0.06] (~teapot).
+        "need_vhacd": false,                              # OPTIONAL, default false
         "start_pose": [x, y, z, qx, qy, qz, qw],
-        "goals": [[x,y,z,qx,qy,qz,qw], ...]                         # (T, 7)
+        "goals": [[x,y,z,qx,qy,qz,qw], ...]               # (T, 7)
     },
     "hand": {
-        "wrist_goals":     [[x,y,z,qx,qy,qz,qw], ...],              # (T, 7)
-        "fingertip_goals": [[[fx,fy,fz]*5], ...],                   # (T, 5, 3) world frame
-        "fingertip_local": [[[fx,fy,fz]*5], ...]                    # (T, 5, 3) wrist-local frame
+        "wrist_goals":     [[x,y,z,qx,qy,qz,qw], ...],    # (T, 7)
+        "fingertip_goals": [[[fx,fy,fz]*5], ...],         # (T, 5, 3) world frame
+        "fingertip_local": [[[fx,fy,fz]*5], ...]          # (T, 5, 3) wrist-local frame
     }
 }
 
@@ -29,7 +33,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -57,10 +61,18 @@ class ReferenceTrajectory:
         fingertip_local: torch.Tensor,               # (T, K, 3) wrist-local frame
         object_urdf_path: Optional[str] = None,
         object_scale: float = 1.0,
+        object_grasp_bbox_scale: Optional[Tuple[float, float, float]] = None,
+        object_need_vhacd: bool = False,
     ) -> None:
         self.meta = meta
         self.object_urdf_path = object_urdf_path
         self.object_scale = float(object_scale)
+        self.object_grasp_bbox_scale = (
+            tuple(object_grasp_bbox_scale)
+            if object_grasp_bbox_scale is not None
+            else (0.06, 0.06, 0.06)
+        )
+        self.object_need_vhacd = bool(object_need_vhacd)
 
         if object_start_pose.shape != (7,):
             raise ValueError(
@@ -140,6 +152,13 @@ class ReferenceTrajectory:
             hand["fingertip_local"], dtype=torch.float32
         )                                                                        # (T, K, 3)
 
+        grasp_bbox = obj.get("grasp_bbox_scale")
+        if grasp_bbox is not None:
+            if len(grasp_bbox) != 3:
+                raise ValueError(
+                    f"object.grasp_bbox_scale must have 3 entries, got {len(grasp_bbox)}"
+                )
+
         return cls(
             meta=d.get("meta", {}),
             object_start_pose=object_start,
@@ -149,6 +168,8 @@ class ReferenceTrajectory:
             fingertip_local=fingertip_local,
             object_urdf_path=obj.get("urdf_path"),
             object_scale=obj.get("scale", 1.0),
+            object_grasp_bbox_scale=grasp_bbox,
+            object_need_vhacd=bool(obj.get("need_vhacd", False)),
         )
 
     # ------------------------------------------------------------------
