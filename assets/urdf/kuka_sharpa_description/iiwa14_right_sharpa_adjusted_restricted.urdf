@@ -289,12 +289,21 @@
       <inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4"/>
     </inertial>
   </link>
-  
-  <!-- VideoRLFollower mount: sharpa_mount → right_hand_flange (translated
-       from the left-hand attachment ``rpy 0 0 -1.5708 xyz 0 0 0.05``).  For
-       right hand we flip the wrist Z by +pi/2 (mirror of left's -pi/2) so
-       the palm faces the same direction relative to the arm.  The xyz is
-       unchanged because both hands mount on the same flange centre. -->
+  <!-- ============================================================================= -->
+  <!-- Create a different *root* for the hand -->
+  <!-- Note: this offset is just eyeballed... -->
+  <joint name="iiwa14_sharpa" type="fixed">
+    <parent link="iiwa14_link_ee"/>
+    <child link="sharpa_mount"/>
+    <origin rpy="0 0 0.261799" xyz="0.00 0 0"/>
+  </joint>
+
+  <!-- VideoRLFollower mount: sharpa_mount → right_hand_flange.  The left
+       hand attaches via rpy="0 0 -1.5708"; for the right hand we mirror the
+       sign to +pi/2 as a heuristic.  ⚠ This rpy MUST be visually validated
+       at the all-zero joint pose in IsaacGym — if the palm points the wrong
+       way, adjust the yaw component (typically by ±pi/2 or pi) so the
+       right-hand thumb sits on the same side as the left's mirror image. -->
   <joint name="sharpa_mount_to_right_flange" type="fixed">
     <origin rpy="0 0 1.5708" xyz="0.0 0.0 0.05"/>
     <parent link="sharpa_mount"/>
