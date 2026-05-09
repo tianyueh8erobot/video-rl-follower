@@ -224,7 +224,13 @@ env:
   tableFriction: 0.5
 
   asset:
-    robot: "urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
+    # Right Sharpa Wave hand on KUKA iiwa14, assembled by
+    # tools/build_iiwa14_right_sharpa_urdf.py from the official
+    # right_sharpa_wave_with_flange.urdf + the SimToolReal iiwa14 chain.
+    # The base SimToolReal env auto-detects the chirality from the substring
+    # "right_sharpa" / "left_sharpa" in this path (see env.use_right_sharpa /
+    # use_left_sharpa).
+    robot: "urdf/kuka_sharpa_description/iiwa14_right_sharpa_adjusted_restricted.urdf"
 
     table: "urdf/table_narrow.urdf"
 

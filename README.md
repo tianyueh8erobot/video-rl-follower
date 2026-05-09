@@ -46,14 +46,38 @@ video_rl_follower/
 
 ## Robot
 
-Sharpa Robotics' official URDF repo (`sharpa-robotics/sharpa-urdf-usd-xml`)
-ships hand-only meshes — no arm.  We therefore reuse SimToolReal's bundled
-**KUKA iiwa14 + left Sharpa Wave hand** description in
-`assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf`.
+KUKA iiwa14 (7-DoF) + Sharpa Wave hand.  Sharpa's official URDF repo
+(`sharpa-robotics/sharpa-urdf-usd-xml`) ships **hand-only** meshes/URDF — no
+arm.  We splice the official ``right_sharpa_wave_with_flange.urdf`` onto
+SimToolReal's KUKA iiwa14 chain via the helper script
+``tools/build_iiwa14_right_sharpa_urdf.py``; the result lives at
+``assets/urdf/kuka_sharpa_description/iiwa14_right_sharpa_adjusted_restricted.urdf``
+and is the default loaded by ``cfg/task/VideoRLFollower.yaml::asset.robot``.
 
-If you later want to swap to right hand, copy the official
-`right_sharpa_wave_with_flange.urdf` from `sharpa-urdf-usd-xml` and re-attach
-it to the KUKA flange.
+The base SimToolReal env auto-detects chirality from the substring
+``right_sharpa`` / ``left_sharpa`` in the URDF path
+(``env.use_right_sharpa`` / ``env.use_left_sharpa``); the right-hand
+fingertip names (``right_index_DP``, …) and right-hand collision filter
+(``RIGHT_SHARPA_KUKA_LINK_TO_ADJACENT_LINKS`` in ``adjacent_links.py``) are
+already wired in upstream, so flipping the cfg is enough.
+
+To rebuild the right-hand assembly URDF:
+
+```bash
+git clone https://github.com/sharpa-robotics/sharpa-urdf-usd-xml /tmp/sharpa_urdf
+python tools/build_iiwa14_right_sharpa_urdf.py \
+    --left-urdf  assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf \
+    --right-urdf /tmp/sharpa_urdf/wave_01/right_sharpa_wave/right_sharpa_wave_with_flange.urdf \
+    --right-meshes-src /tmp/sharpa_urdf/wave_01/right_sharpa_wave/meshes \
+    --out-urdf  assets/urdf/kuka_sharpa_description/iiwa14_right_sharpa_adjusted_restricted.urdf \
+    --out-meshes assets/urdf/kuka_sharpa_description/right_sharpa_meshes
+```
+
+> ⚠️  Visual validation needed: the wrist mount rpy is set to `(0, 0, +π/2)` as
+> a mirror of the left hand's `(0, 0, -π/2)`.  Load the assembled URDF in
+> IsaacGym at the all-zero joint pose and verify that the palm faces the
+> intended direction; tweak the `sharpa_mount_to_right_flange` joint origin if
+> not.
 
 ## Setup
 

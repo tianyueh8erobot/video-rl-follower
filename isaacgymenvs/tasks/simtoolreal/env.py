@@ -3206,9 +3206,11 @@ class SimToolReal(VecTask):
         if CHECK_WITH_COMPUTED_OBS:
             # Create urdf object
             if not hasattr(self, "urdf_object"):
-                self.urdf_object = create_urdf_object(
-                    robot_name="iiwa14_left_sharpa_adjusted_restricted"
-                )
+                # Match the URDF we actually loaded for the env so the FK
+                # cross-check uses the right chirality.
+                _robot_path = self.cfg["env"]["asset"]["robot"]
+                _robot_name = Path(_robot_path).stem
+                self.urdf_object = create_urdf_object(robot_name=_robot_name)
 
             computed_obs = compute_observation(
                 q=self.arm_hand_dof_pos.cpu().numpy(),

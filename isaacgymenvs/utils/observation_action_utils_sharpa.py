@@ -230,14 +230,21 @@ OBJECT_KEYPOINT_OFFSETS_np = np.array(
 
 
 def create_urdf_object(
-    robot_name: Literal["iiwa14_left_sharpa_adjusted_restricted"],
+    robot_name: Literal[
+        "iiwa14_left_sharpa_adjusted_restricted",
+        "iiwa14_right_sharpa_adjusted_restricted",
+    ],
 ) -> yourdfpy.URDF:
     asset_root = Path(__file__).parent / "../../assets"
     assert asset_root.exists(), f"Asset root {asset_root} does not exist"
-    if robot_name == "iiwa14_left_sharpa_adjusted_restricted":
+    valid = {
+        "iiwa14_left_sharpa_adjusted_restricted",
+        "iiwa14_right_sharpa_adjusted_restricted",
+    }
+    if robot_name in valid:
         urdf_path = (
             asset_root
-            / "urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
+            / f"urdf/kuka_sharpa_description/{robot_name}.urdf"
         )
     else:
         raise ValueError(f"Invalid robot name: {robot_name}")
