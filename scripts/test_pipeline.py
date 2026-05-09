@@ -54,8 +54,14 @@ def _print_check(name: str, ok: bool, msg: str = "") -> bool:
     return ok
 
 
-def _build_env(cfg_overrides: dict, headless: bool) -> object:
-    """Construct a VideoRLFollower env directly via IsaacGymEnvs hydra cfg."""
+def _build_env(cfg_overrides: dict, headless: bool, deterministic_spawn: bool = True) -> object:
+    """Construct a VideoRLFollower env directly via IsaacGymEnvs hydra cfg.
+
+    When ``deterministic_spawn`` is True we disable object reset noise + object
+    rotation randomisation so that T2 (spawn pose) can compare against the
+    trajectory's start_pose with a tight tolerance.  Other tests don't care
+    about the noise — they just verify deltas — so we keep the same env.
+    """
     from hydra import compose, initialize
     from isaacgymenvs.utils.reformat import omegaconf_to_dict
     from isaacgymenvs.utils.rlgames_utils import get_rlgames_env_creator
@@ -66,12 +72,26 @@ def _build_env(cfg_overrides: dict, headless: bool) -> object:
             "task=VideoRLFollower",
             f"num_envs={cfg_overrides['num_envs']}",
             f"headless={'true' if headless else 'false'}",
-            "test=true",                                    # no checkpoint loading
+            "test=true",
             "seed=42",
         ])
 
     if "trajectoryPath" in cfg_overrides:
         cfg.task.env.trajectoryPath = cfg_overrides["trajectoryPath"]
+
+    if deterministic_spawn:
+        cfg.task.env.useFixedInitObjectPose = True
+        cfg.task.env.resetPositionNoiseX = 0.0
+        cfg.task.env.resetPositionNoiseY = 0.0
+        cfg.task.env.resetPositionNoiseZ = 0.0
+        cfg.task.env.randomizeObjectRotation = False
+        # Disable observation/action delay so reset → next obs is current-frame.
+        cfg.task.env.useObsDelay = False
+        cfg.task.env.useActionDelay = False
+        cfg.task.env.useObjectStateDelayNoise = False
+        # Disable random force perturbations on the object.
+        cfg.task.env.force_scale = 0.0
+        cfg.task.env.random_force_prob_scalar = 0.0
 
     cfg_dict = omegaconf_to_dict(cfg.task)
     cfg_dict["env"]["numEnvs"] = cfg_overrides["num_envs"]
@@ -89,6 +109,30 @@ def _build_env(cfg_overrides: dict, headless: bool) -> object:
         force_render=not headless,
     )
     return creator()
+
+
+def _hard_reset(env) -> None:
+    """Force the env to actually reset every environment's physics state.
+
+    ``env.reset()`` in this codebase only returns the current observation; it
+    does NOT call ``reset_idx``.  We invoke ``reset_idx`` directly with all
+    env ids and then refresh the cached state tensors so subsequent reads
+    (object_state, arm_hand_dof_pos, palm_center_pos) reflect the post-reset
+    state.
+    """
+    env_ids = torch.arange(env.num_envs, device=env.device)
+    env.reset_idx(env_ids)
+    # Many SimToolReal post-reset writes are deferred to be batched — flush
+    # them and refresh the cached state tensors.
+    if hasattr(env, "set_actor_root_state_tensor_indexed"):
+        env.set_actor_root_state_tensor_indexed()
+    if hasattr(env, "set_dof_state_tensor_indexed"):
+        env.set_dof_state_tensor_indexed()
+    env.gym.simulate(env.sim)
+    env.gym.fetch_results(env.sim, True)
+    env.gym.refresh_actor_root_state_tensor(env.sim)
+    env.gym.refresh_dof_state_tensor(env.sim)
+    env.gym.refresh_rigid_body_state_tensor(env.sim)
 
 
 def _step_with_action(env, action: torch.Tensor, n_steps: int):
@@ -133,27 +177,30 @@ def test_construction(env) -> bool:
 
 
 def test_object_spawn(env) -> bool:
-    """T2: object spawns within tolerance of trajectory.start_pose."""
+    """T2: object spawns within tolerance of trajectory.start_pose.
+
+    Run with deterministic_spawn=True (no reset noise / no rotation random),
+    so the only residual delta should come from physics settling within one
+    sim step (sub-cm).
+    """
     print("\n[T2] Object spawn pose")
-    # Reset every env to get fresh initial state.
-    env.reset()
-    # SimToolReal stores object state at self.object_state[:, 0:7].
+    _hard_reset(env)
     obj_xyz = env.object_state[:, 0:3]                          # (N, 3)
     expected = env.trajectory.object_start_pose[:3].to(env.device)  # (3,)
     delta = torch.norm(obj_xyz - expected[None], dim=-1)        # (N,)
     max_d = float(delta.max())
-    # Spawn tolerance: 5 cm (procedural primitive paths randomize ±few cm).
+    # With randomization off, expect sub-cm agreement.
     return _print_check(
         "object xyz close to trajectory.start_pose",
-        max_d < 0.05,
-        f"max distance {max_d * 100:.2f} cm (expected < 5 cm)",
+        max_d < 0.02,
+        f"max distance {max_d * 100:.2f} cm (expected < 2 cm with no randomization)",
     )
 
 
 def test_arm_driven(env) -> bool:
     """T3: applying arm joint targets actually moves the arm DOFs."""
     print("\n[T3] Arm DOF response to action")
-    env.reset()
+    _hard_reset(env)
     n_arm = 7
     n_total = env.num_robot_actions
 
@@ -180,7 +227,7 @@ def test_arm_driven(env) -> bool:
 def test_fingers_driven(env) -> bool:
     """T4: applying finger joint targets actually moves the finger DOFs."""
     print("\n[T4] Finger DOF response to action")
-    env.reset()
+    _hard_reset(env)
     n_arm = 7
     n_total = env.num_robot_actions
     n_hand = n_total - n_arm
@@ -211,7 +258,7 @@ def test_palm_follows_arm(env) -> bool:
     right_hand_flange is intact (not broken or detached).
     """
     print("\n[T5] Palm follows arm (splice joint integrity)")
-    env.reset()
+    _hard_reset(env)
     n_arm = 7
     n_total = env.num_robot_actions
     palm_p0 = env.palm_center_pos.clone()

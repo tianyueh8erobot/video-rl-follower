@@ -304,29 +304,33 @@ class TrajectoryViewer:
     # ------------------------------------------------------------------
 
     def _set_actor_pose(self, actor_handle: int, pos: np.ndarray, quat_xyzw=None) -> None:
-        """Teleport an actor's root state."""
-        # set_actor_root_state_tensor needs the entire root tensor; we work
-        # one actor at a time using set_actor_state which accepts a Transform.
-        state = self.gym.get_actor_rigid_body_states(self.env, actor_handle, gymapi.STATE_POS)
-        # state['pose']['p'] is a structured array (x, y, z); easier to use
-        # the higher-level helper.
-        tf = gymapi.Transform()
-        tf.p = gymapi.Vec3(float(pos[0]), float(pos[1]), float(pos[2]))
+        """Teleport an actor's *root* (and zero velocities) so multi-body
+        URDFs end up consistently posed and PhysX doesn't carry stale velocity
+        into the next frame.
+
+        We always operate on the actor's root state; this works for both
+        single-body marker spheres and multi-body URDF objects (their child
+        rigid bodies get re-articulated automatically next sim step).
+        """
         if quat_xyzw is None:
-            tf.r = gymapi.Quat(0, 0, 0, 1)
-        else:
-            tf.r = gymapi.Quat(*[float(v) for v in quat_xyzw])
-        # set rigid body 0's pose (single-link asset)
-        body_states = state
-        body_states["pose"]["p"]["x"][0] = tf.p.x
-        body_states["pose"]["p"]["y"][0] = tf.p.y
-        body_states["pose"]["p"]["z"][0] = tf.p.z
-        body_states["pose"]["r"]["x"][0] = tf.r.x
-        body_states["pose"]["r"]["y"][0] = tf.r.y
-        body_states["pose"]["r"]["z"][0] = tf.r.z
-        body_states["pose"]["r"]["w"][0] = tf.r.w
+            quat_xyzw = (0.0, 0.0, 0.0, 1.0)
+        state = self.gym.get_actor_rigid_body_states(
+            self.env, actor_handle, gymapi.STATE_ALL
+        )
+        # Index 0 == root link.  Set pos/quat AND zero velocity to prevent
+        # any leftover momentum from leaking into the next frame.
+        state["pose"]["p"]["x"][0] = float(pos[0])
+        state["pose"]["p"]["y"][0] = float(pos[1])
+        state["pose"]["p"]["z"][0] = float(pos[2])
+        state["pose"]["r"]["x"][0] = float(quat_xyzw[0])
+        state["pose"]["r"]["y"][0] = float(quat_xyzw[1])
+        state["pose"]["r"]["z"][0] = float(quat_xyzw[2])
+        state["pose"]["r"]["w"][0] = float(quat_xyzw[3])
+        for f in ("x", "y", "z"):
+            state["vel"]["linear"][f][0] = 0.0
+            state["vel"]["angular"][f][0] = 0.0
         self.gym.set_actor_rigid_body_states(
-            self.env, actor_handle, body_states, gymapi.STATE_POS
+            self.env, actor_handle, state, gymapi.STATE_ALL
         )
 
     def _apply_frame(self, t: int) -> None:
@@ -360,6 +364,7 @@ class TrajectoryViewer:
                 for event in self.gym.query_viewer_action_events(self.viewer):
                     if event.value == 0:
                         continue
+                    manual_change = False
                     if event.action == "toggle":
                         self.playing = not self.playing
                         print(f"[viz] {'playing' if self.playing else 'paused'}")
@@ -367,16 +372,23 @@ class TrajectoryViewer:
                         self.frame_idx = (self.frame_idx + 1) % self.traj.num_goals
                         self._apply_frame(self.frame_idx)
                         print(f"[viz] frame {self.frame_idx + 1}/{self.traj.num_goals}")
+                        manual_change = True
                     elif event.action == "prev":
                         self.frame_idx = (self.frame_idx - 1) % self.traj.num_goals
                         self._apply_frame(self.frame_idx)
                         print(f"[viz] frame {self.frame_idx + 1}/{self.traj.num_goals}")
+                        manual_change = True
                     elif event.action == "reset":
                         self.frame_idx = 0
                         self._apply_frame(self.frame_idx)
                         print("[viz] reset to frame 0")
+                        manual_change = True
                     elif event.action == "quit":
                         return
+                    if manual_change:
+                        # Defer the next auto-advance by a full period so the
+                        # user can scrub without a stray automatic frame.
+                        last_advance = time.time()
 
             # Auto-advance
             now = time.time()
@@ -435,8 +447,34 @@ def main() -> int:
           f"urdf_path={traj.object_urdf_path}")
 
     auto_ok = _auto_check(traj)
+
     if args.auto:
-        return 0 if auto_ok else 1
+        # Beyond the data-only auto checks, also exercise the IsaacGym scene
+        # path (asset load, actor spawn, teleport) so that broken URDFs /
+        # missing meshes / runtime errors do not silently pass.
+        print("\n[auto] running headless IsaacGym scene checks…")
+        viewer = TrajectoryViewer(
+            traj=traj, headless=True, hz=args.hz, loop=False
+        )
+        try:
+            scene_ok = True
+            try:
+                # Apply the first, middle and last frames; step PhysX a couple
+                # of times after each to confirm no asset-load explosion.
+                for t in (0, traj.num_goals // 2, traj.num_goals - 1):
+                    viewer.frame_idx = t
+                    viewer._apply_frame(t)
+                    for _ in range(2):
+                        viewer.gym.simulate(viewer.sim)
+                        viewer.gym.fetch_results(viewer.sim, True)
+                print(f"  ✓ teleported through frames 0, mid, last "
+                      f"({traj.num_goals} total)")
+            except Exception as exc:
+                scene_ok = False
+                print(f"  ✗ scene step failed: {type(exc).__name__}: {exc}")
+        finally:
+            viewer.close()
+        return 0 if (auto_ok and scene_ok) else 1
 
     viewer = TrajectoryViewer(
         traj=traj, headless=False, hz=args.hz, loop=not args.no_loop

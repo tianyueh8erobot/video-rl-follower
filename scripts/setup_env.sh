@@ -108,6 +108,7 @@ fi
 # ---------------------------------------------------------------------------
 # Other deps
 # ---------------------------------------------------------------------------
+# --- Required deps: any failure here aborts setup -------------------------
 "$PIPBIN" install --quiet -i "$PIP_INDEX_URL" --upgrade \
     "rl-games>=1.6.0" \
     "hydra-core>=1.2" \
@@ -119,9 +120,16 @@ fi
     "gym==0.23.1" \
     "termcolor" \
     "matplotlib" \
-    "open3d" \
-    "tensorboard" \
-    "wandb" || true   # tolerate one-off failures (e.g., open3d wheel missing)
+    "tensorboard"
+
+# --- Optional deps (extras for visualisation / logging) -------------------
+for opt in open3d wandb; do
+    if ! "$PIPBIN" install --quiet -i "$PIP_INDEX_URL" "$opt"; then
+        echo "[setup] WARN: optional package '$opt' failed to install; "\
+             "skipping (the visualisation Open3D backend / wandb logging will "\
+             "not work without it)."
+    fi
+done
 
 # Editable install of THIS repo
 "$PIPBIN" install --quiet -i "$PIP_INDEX_URL" -e "$PROJECT_ROOT"
@@ -132,10 +140,39 @@ fi
 echo
 echo "[verify] Importing key modules…"
 "$PYBIN" - <<'PY'
-import isaacgym
+import sys
+# Required modules — any ImportError must abort setup.
+required = {
+    "isaacgym":      "IsaacGym",
+    "torch":         "PyTorch",
+    "rl_games":      "rl_games",
+    "hydra":         "hydra-core",
+    "omegaconf":     "omegaconf",
+    "trimesh":       "trimesh",
+    "urdfpy":        "urdfpy",
+    "yourdfpy":      "yourdfpy (FK utility for SimToolReal cross-check)",
+    "warp":          "warp-lang",
+    "gym":           "gym",
+    "matplotlib":    "matplotlib",
+}
+missing = []
+for mod, label in required.items():
+    try:
+        __import__(mod)
+    except Exception as e:
+        missing.append((mod, label, repr(e)))
+if missing:
+    print("  ✗ MISSING required modules:")
+    for mod, label, err in missing:
+        print(f"      {mod}  ({label}) :: {err}")
+    sys.exit(1)
+# Project-side: confirm the env class loads (this also exercises the
+# subclass + algos.dapg + dextoolbench import paths).
 from isaacgymenvs.tasks.video_rl_follower.env import VideoRLFollower
 from isaacgymenvs.tasks.video_rl_follower.trajectory import ReferenceTrajectory
+from isaacgymenvs.algos.dapg import DAPGAgent
 from isaacgymenvs.tasks import isaacgym_task_map
+assert "VideoRLFollower" in isaacgym_task_map
 print("  task map:", list(isaacgym_task_map.keys()))
 print("  ✓ all imports OK")
 PY
