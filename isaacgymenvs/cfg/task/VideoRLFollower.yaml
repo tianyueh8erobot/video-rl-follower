@@ -17,6 +17,16 @@ env:
   # SimToolReal asset path (controlled by ``objectName``).
   useTrajectoryObject: True
 
+  # Object physics knobs.  ManipTrans's _create_obj_assets (dexhandmanip_sh.py:572)
+  # uses fix_base_link=False and DOES NOT set disable_gravity, i.e. real gravity
+  # is on; the "G=0 → restore" curriculum mentioned in the paper is sim-level
+  # (gym.set_sim_params at runtime), not asset-level.  We follow the same
+  # convention: object has gravity, sim_params can be relaxed if the user wants
+  # an early-training crutch.
+  objectDisableGravity: False
+  objectAngularDamping: 0.0
+  objectLinearDamping: 0.0
+
   # Reward weights for the hand-pose follow-up (added on top of object reward)
   handPoseRewardScale:
     wristPos: 1.0

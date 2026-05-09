@@ -263,6 +263,53 @@ class VideoRLFollower(SimToolReal):
         return object_asset_files, object_asset_scales, need_vhacds
 
     # ------------------------------------------------------------------
+    # Object asset gravity / damping override
+    # ------------------------------------------------------------------
+
+    def _load_main_object_asset(self):
+        """Override SimToolReal's loader so the user can flip
+        ``objectDisableGravity`` / damping per-task without touching code.
+
+        Defaults match ManipTrans's _create_obj_assets
+        (dexhandmanip_sh.py:572): ``fix_base_link=False``, gravity ENABLED,
+        no extra damping.  The paper's "G=0 → restore" relaxation is
+        sim-level (gym.set_sim_params) and is NOT applied here.
+        """
+        from isaacgym import gymapi
+        import os as _os
+
+        disable_g  = bool(self.cfg["env"].get("objectDisableGravity", False))
+        ang_damp   = float(self.cfg["env"].get("objectAngularDamping", 0.0))
+        lin_damp   = float(self.cfg["env"].get("objectLinearDamping", 0.0))
+
+        object_assets = []
+        for object_asset_file, need_vhacd in zip(
+            self.object_asset_files, self.object_need_vhacds
+        ):
+            opts = gymapi.AssetOptions()
+            opts.vhacd_enabled = need_vhacd
+            opts.collapse_fixed_joints = True
+            opts.replace_cylinder_with_capsule = True
+            opts.disable_gravity = disable_g
+            opts.angular_damping = ang_damp
+            opts.linear_damping = lin_damp
+
+            asset = self.gym.load_asset(
+                self.sim,
+                _os.path.dirname(object_asset_file),
+                _os.path.basename(object_asset_file),
+                opts,
+            )
+            object_assets.append(asset)
+
+        rb_count = self.gym.get_asset_rigid_body_count(object_assets[0])
+        sh_count = self.gym.get_asset_rigid_shape_count(object_assets[0])
+        print(f"[VideoRLFollower] object asset loaded with "
+              f"disable_gravity={disable_g}, lin_damp={lin_damp}, "
+              f"ang_damp={ang_damp}")
+        return object_assets, rb_count, sh_count
+
+    # ------------------------------------------------------------------
     # Trajectory-aware goal handling
     # ------------------------------------------------------------------
 
