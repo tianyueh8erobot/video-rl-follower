@@ -119,6 +119,16 @@ class ReferenceTrajectory:
         object_need_vhacd: bool = False,
         joints_world: Optional[torch.Tensor] = None,   # (T, 21, 3) optional
         joints_local: Optional[torch.Tensor] = None,   # (T, 21, 3) optional
+        # ManipTrans-retargeted dexhand link positions in the SAME gym frame
+        # the env spawns the robot in.  Shape (T, n_dex_links, 3); enables the
+        # full-hand-tracking reward (28 link weighted MSE in our Sharpa env).
+        dex_links_world: Optional[torch.Tensor] = None,
+        # Companion: per-frame dexhand joint angles (T, n_dof).  Used as
+        # initialisation hint or as a soft regulariser; stored but not
+        # required for the position-based reward.
+        dex_dof_pos: Optional[torch.Tensor] = None,
+        # Per-link names (so the env knows which q maps to which body)
+        dex_link_names: Optional[List[str]] = None,
     ) -> None:
         self.meta = meta
         self.object_urdf_path = object_urdf_path
@@ -186,6 +196,27 @@ class ReferenceTrajectory:
         self.joints_local = joints_local.float() if joints_local is not None else None
         self.has_skeleton = self.joints_world is not None
 
+        # Optional ManipTrans retarget output (full-hand tracking)
+        if dex_links_world is not None:
+            if dex_links_world.ndim != 3 or dex_links_world.shape[0] != T or dex_links_world.shape[2] != 3:
+                raise ValueError(
+                    "dex_links_world must be shape (T, L, 3), got "
+                    f"{tuple(dex_links_world.shape)} (T={T})"
+                )
+        if dex_dof_pos is not None:
+            if dex_dof_pos.ndim != 2 or dex_dof_pos.shape[0] != T:
+                raise ValueError(
+                    f"dex_dof_pos must be shape (T, n_dof), got {tuple(dex_dof_pos.shape)}"
+                )
+        self.dex_links_world = (
+            dex_links_world.float() if dex_links_world is not None else None
+        )
+        self.dex_dof_pos = (
+            dex_dof_pos.float() if dex_dof_pos is not None else None
+        )
+        self.dex_link_names = list(dex_link_names) if dex_link_names is not None else None
+        self.has_retargeted = self.dex_links_world is not None
+
     # ------------------------------------------------------------------
     # construction helpers
     # ------------------------------------------------------------------
@@ -252,6 +283,19 @@ class ReferenceTrajectory:
                 hand["joints_local"], dtype=torch.float32
             )
 
+        # Optional ManipTrans-retargeted dexhand state
+        dex_links_world = None
+        dex_dof_pos = None
+        dex_link_names = None
+        if "dex" in d:
+            dex = d["dex"]
+            if "links_world" in dex:
+                dex_links_world = torch.as_tensor(dex["links_world"], dtype=torch.float32)
+            if "dof_pos" in dex:
+                dex_dof_pos = torch.as_tensor(dex["dof_pos"], dtype=torch.float32)
+            if "link_names" in dex:
+                dex_link_names = list(dex["link_names"])
+
         return cls(
             meta=d.get("meta", {}),
             object_start_pose=object_start,
@@ -265,6 +309,9 @@ class ReferenceTrajectory:
             object_need_vhacd=bool(obj.get("need_vhacd", False)),
             joints_world=joints_world,
             joints_local=joints_local,
+            dex_links_world=dex_links_world,
+            dex_dof_pos=dex_dof_pos,
+            dex_link_names=dex_link_names,
         )
 
     # ------------------------------------------------------------------
@@ -281,6 +328,10 @@ class ReferenceTrajectory:
             self.joints_world = self.joints_world.to(device)
         if self.joints_local is not None:
             self.joints_local = self.joints_local.to(device)
+        if self.dex_links_world is not None:
+            self.dex_links_world = self.dex_links_world.to(device)
+        if self.dex_dof_pos is not None:
+            self.dex_dof_pos = self.dex_dof_pos.to(device)
         return self
 
     # ------------------------------------------------------------------

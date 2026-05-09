@@ -39,6 +39,22 @@ env:
   # Whether to append (wrist_goal, fingertip_goal_local) to the policy obs.
   exposeHandGoalToPolicy: True
 
+  # Full-hand-tracking reward (ManipTrans imitator style).  Only active when
+  # the trajectory JSON contains a `dex` block (run
+  # tools/merge_retarget_into_trajectory.py to add it).  Set ``enable`` to a
+  # non-zero scalar (e.g. 2.0) to turn it on; per-link weights match
+  # ManipTrans/dexhandimitator.py:1158-1166 grouping.
+  fullHandTrackingScale:
+    enable:    0.0      # 0 → off; 1.0–2.0 typical when on
+    thumbTip:  0.9
+    indexTip:  0.8
+    middleTip: 0.75
+    ringTip:   0.6
+    pinkyTip:  0.6
+    level1:    0.5      # MCP_VL of each finger
+    level2:    0.3      # PIP/DIP/intermediate links
+    lambda:    50.0     # decay rate (m^-1)
+
   # ----- SimToolReal-inherited settings (kept) -----
   # if given, will override the device setting in gym.
   numEnvs: ${resolve_default:8192,${...num_envs}}

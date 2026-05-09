@@ -101,6 +101,22 @@ class VideoRLFollower(SimToolReal):
         self.expose_hand_goal_to_policy = bool(
             cfg["env"].get("exposeHandGoalToPolicy", True)
         )
+        # Full-hand-tracking reward weights (only active if trajectory has
+        # ManipTrans-retargeted dex_links_world; ManipTrans-style three groups).
+        # See sharpa.py weight_idx for index→link mapping.
+        # Defaults follow ManipTrans/dexhandimitator.py:1158-1166 — finer per-finger
+        # weighting, with thumb/index/middle weighted higher than ring/pinky and
+        # MCP/intermediate links carrying less weight than tips.
+        fh = cfg["env"].get("fullHandTrackingScale", {}) or {}
+        self.w_full_hand          = float(fh.get("enable", 0.0))   # 0 → off
+        self.w_full_hand_thumbtip = float(fh.get("thumbTip", 0.9))
+        self.w_full_hand_indextip = float(fh.get("indexTip", 0.8))
+        self.w_full_hand_midtip   = float(fh.get("middleTip", 0.75))
+        self.w_full_hand_ringtip  = float(fh.get("ringTip", 0.6))
+        self.w_full_hand_pinktip  = float(fh.get("pinkyTip", 0.6))
+        self.w_full_hand_lvl1     = float(fh.get("level1", 0.5))   # MCP_VL
+        self.w_full_hand_lvl2     = float(fh.get("level2", 0.3))   # PIP/DIP/intermediate
+        self.lambda_full_hand     = float(fh.get("lambda", 50.0))
 
         # ----- Force fixed-goal mode -----
         # The base class only ever reads trajectory_states[..., 0:7] for the
@@ -163,6 +179,30 @@ class VideoRLFollower(SimToolReal):
 
         if self.expose_hand_goal_to_policy:
             self._extend_obs_state_spaces()
+
+        # Full-hand tracking setup (only if trajectory has retargeted data
+        # AND user actually enabled the reward via cfg).
+        self._full_hand_active = (
+            self.w_full_hand > 0.0 and self._trajectory.has_retargeted
+        )
+        if self.w_full_hand > 0.0 and not self._trajectory.has_retargeted:
+            print("[VideoRLFollower] WARN: fullHandTrackingScale.enable > 0 but "
+                  "the trajectory has no dex retarget data; full-hand reward "
+                  "is disabled.  Run tools/merge_retarget_into_trajectory.py "
+                  "to enrich the JSON.")
+        if self._full_hand_active:
+            self._setup_full_hand_link_indices()
+            self._dex_goal_world = torch.zeros(
+                (self.num_envs, self._trajectory.dex_links_world.shape[1], 3),
+                device=self.device, dtype=torch.float32,
+            )
+            print(f"[VideoRLFollower] full-hand tracking ON: "
+                  f"{len(self._dex_link_handles)} links matched "
+                  f"({self._trajectory.dex_links_world.shape[1]} declared in pkl)")
+        else:
+            self._dex_goal_world = None
+            self._dex_link_handles = []
+            self._dex_link_weights = None
 
     # ------------------------------------------------------------------
     # Space + queue resize so rl_games sees the correct shapes
@@ -313,6 +353,59 @@ class VideoRLFollower(SimToolReal):
     # Trajectory-aware goal handling
     # ------------------------------------------------------------------
 
+    def _setup_full_hand_link_indices(self) -> None:
+        """Map trajectory dex_link_names → SimToolReal rigid_body handles.
+
+        Some pkl link names may not exist as separate rigid bodies in the
+        loaded URDF (e.g., elastomer / fingertip fixed sub-links may be
+        merged); we only track those that DO exist, and remember the
+        per-link reward weight derived from the dexhand's weight_idx.
+        """
+        from isaacgymenvs.tasks.simtoolreal.env import SimToolReal  # noqa
+        link_names = self._trajectory.dex_link_names
+        env_ptr = self.envs[0]
+        robot_actor = self.dexhand_actors[0] if hasattr(self, "dexhand_actors") else 0
+        # Compose per-pkl-link weight from the dexhand.weight_idx groups
+        weight_groups = {
+            "thumb_tip":  self.w_full_hand_thumbtip,
+            "index_tip":  self.w_full_hand_indextip,
+            "middle_tip": self.w_full_hand_midtip,
+            "ring_tip":   self.w_full_hand_ringtip,
+            "pinky_tip":  self.w_full_hand_pinktip,
+            "level_1_joints": self.w_full_hand_lvl1,
+            "level_2_joints": self.w_full_hand_lvl2,
+        }
+        # Build link_idx → weight by looking at each link's group in dexhand.weight_idx
+        link_to_weight: dict = {}
+        if hasattr(self, "dexhand"):
+            for grp, w in weight_groups.items():
+                if grp not in self.dexhand.weight_idx:
+                    continue
+                for body_idx in self.dexhand.weight_idx[grp]:
+                    body_name = self.dexhand.body_names[body_idx]
+                    link_to_weight[body_name] = w
+
+        handles, weights, traj_indices = [], [], []
+        skipped = []
+        for i, name in enumerate(link_names):
+            h = self.gym.find_actor_rigid_body_handle(env_ptr, robot_actor, name)
+            if h < 0:
+                skipped.append(name)
+                continue
+            handles.append(h)
+            weights.append(link_to_weight.get(name, self.w_full_hand_lvl2))   # default low weight
+            traj_indices.append(i)
+        if skipped:
+            print(f"[VideoRLFollower] full-hand: {len(skipped)} pkl links not "
+                  f"found in URDF (skipped): {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
+        self._dex_link_handles = handles                  # (M,)  M ≤ pkl_n_links
+        self._dex_link_traj_idx = torch.tensor(
+            traj_indices, device=self.device, dtype=torch.long
+        )                                                 # (M,) into pkl axis
+        self._dex_link_weights = torch.tensor(
+            weights, device=self.device, dtype=torch.float32
+        )                                                 # (M,)
+
     def _set_hand_goal_from_trajectory(self, env_ids: Tensor) -> None:
         if env_ids.numel() == 0:
             return
@@ -320,6 +413,8 @@ class VideoRLFollower(SimToolReal):
         idx = (self.successes[env_ids].long() % T)
         self._wrist_goal[env_ids] = self._trajectory.wrist_goals[idx]
         self._fingertip_goal_local[env_ids] = self._trajectory.fingertip_local[idx]
+        if self._dex_goal_world is not None:
+            self._dex_goal_world[env_ids] = self._trajectory.dex_links_world[idx]
 
     def _reset_target(
         self,
@@ -370,6 +465,25 @@ class VideoRLFollower(SimToolReal):
     # Reward
     # ------------------------------------------------------------------
 
+    def _full_hand_reward(self) -> Tensor:
+        """Weighted L2 distance between Sharpa link world positions and the
+        retargeted dex_links_world from the trajectory.  Returns (N,)
+        scaled exp-decay reward in [0, 1] before applying w_full_hand.
+        """
+        if not self._full_hand_active:
+            return torch.zeros(self.num_envs, device=self.device)
+        rb = self.gym.acquire_rigid_body_state_tensor(self.sim)
+        rb_t = self._rigid_body_state_tensor.view(self.num_envs, -1, 13)
+        # Subset only the link handles we actually have
+        link_idx = torch.tensor(self._dex_link_handles, device=self.device, dtype=torch.long)
+        actual = rb_t[:, link_idx, :3]                          # (N, M, 3)
+        target = self._dex_goal_world[:, self._dex_link_traj_idx]   # (N, M, 3)
+        dist = torch.norm(actual - target, dim=-1)              # (N, M)
+        # weighted mean across M links
+        wsum = self._dex_link_weights.sum().clamp_min(1e-6)
+        weighted = (dist * self._dex_link_weights[None]).sum(dim=-1) / wsum
+        return torch.exp(-self.lambda_full_hand * weighted)     # (N,)
+
     def _hand_pose_reward(self) -> Tuple[Tensor, Tensor, Tensor]:
         """Compute three hand-pose reward terms, each in [0, 1] before scaling.
 
@@ -409,10 +523,12 @@ class VideoRLFollower(SimToolReal):
         rew_buf, is_success = super().compute_kuka_reward()
 
         wrist_pos_rew, wrist_rot_rew, fingertip_rew = self._hand_pose_reward()
+        full_hand_rew = self._full_hand_reward()      # zeros if disabled
         hand_extra = (
             self.w_wrist_pos * wrist_pos_rew
             + self.w_wrist_rot * wrist_rot_rew
             + self.w_fingertip * fingertip_rew
+            + self.w_full_hand * full_hand_rew
         )
         self.rew_buf[:] = rew_buf + hand_extra
 
@@ -427,9 +543,13 @@ class VideoRLFollower(SimToolReal):
             self.rewards_episode["raw_fingertip_rew"] = torch.zeros_like(
                 self.rew_buf
             )
+            self.rewards_episode["raw_full_hand_rew"] = torch.zeros_like(
+                self.rew_buf
+            )
         self.rewards_episode["raw_wrist_pos_rew"] += wrist_pos_rew
         self.rewards_episode["raw_wrist_rot_rew"] += wrist_rot_rew
         self.rewards_episode["raw_fingertip_rew"] += fingertip_rew
+        self.rewards_episode["raw_full_hand_rew"] += full_hand_rew
 
         return self.rew_buf, is_success
 
