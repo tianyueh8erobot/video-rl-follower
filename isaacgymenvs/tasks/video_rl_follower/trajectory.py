@@ -22,11 +22,36 @@ A trajectory file is a JSON with this schema (see tools/process_maniptrans_traje
     "hand": {
         "wrist_goals":     [[x,y,z,qx,qy,qz,qw], ...],    # (T, 7)
         "fingertip_goals": [[[fx,fy,fz]*5], ...],         # (T, 5, 3) world frame
-        "fingertip_local": [[[fx,fy,fz]*5], ...]          # (T, 5, 3) wrist-local frame
+        "fingertip_local": [[[fx,fy,fz]*5], ...],         # (T, 5, 3) wrist-local frame
+
+        # OPTIONAL — full hand skeleton.  When present these are used by the
+        # IsaacGym visualiser to draw the 21-keypoint skeleton:
+        "joints_world":    [[[x,y,z]*21], ...],           # (T, 21, 3) world frame
+        "joints_local":    [[[x,y,z]*21], ...]            # (T, 21, 3) wrist-local frame
     }
 }
 
-T must match between object.goals, wrist_goals, fingertip_goals, fingertip_local.
+T must match between every (T, *) array.
+
+The 21 hand keypoints follow the MANO ordering (this is what
+``tools/process_maniptrans_trajectory.py`` writes when --with-skeleton is
+enabled, and what the visualiser will use to draw the skeleton):
+
+    0  : wrist
+    1-3: index_proximal, index_intermediate, index_distal
+    4-6: middle_proximal, middle_intermediate, middle_distal
+    7-9: pinky_proximal, pinky_intermediate, pinky_distal
+   10-12: ring_proximal, ring_intermediate, ring_distal
+   13-15: thumb_proximal, thumb_intermediate, thumb_distal
+   16-20: index_tip, middle_tip, pinky_tip, ring_tip, thumb_tip
+
+Bones (parent → child pairs) for skeleton rendering — 20 segments:
+
+    (0,1) (1,2) (2,3) (3,16)            # index   chain
+    (0,4) (4,5) (5,6) (6,17)            # middle  chain
+    (0,7) (7,8) (8,9) (9,18)            # pinky   chain
+    (0,10) (10,11) (11,12) (12,19)      # ring    chain
+    (0,13) (13,14) (14,15) (15,20)      # thumb   chain
 """
 
 from __future__ import annotations
@@ -51,6 +76,35 @@ class ReferenceTrajectory:
     before training.
     """
 
+    # Standard 21-keypoint MANO ordering used by tools/process_maniptrans_trajectory.py
+    MANO_JOINT_ORDER = [
+        "wrist",
+        "index_proximal",  "index_intermediate",  "index_distal",
+        "middle_proximal", "middle_intermediate", "middle_distal",
+        "pinky_proximal",  "pinky_intermediate",  "pinky_distal",
+        "ring_proximal",   "ring_intermediate",   "ring_distal",
+        "thumb_proximal",  "thumb_intermediate",  "thumb_distal",
+        "index_tip", "middle_tip", "pinky_tip", "ring_tip", "thumb_tip",
+    ]
+    # 20 bones (parent→child indices)
+    MANO_BONE_PAIRS = [
+        (0, 1), (1, 2), (2, 3), (3, 16),       # index
+        (0, 4), (4, 5), (5, 6), (6, 17),       # middle
+        (0, 7), (7, 8), (8, 9), (9, 18),       # pinky
+        (0, 10), (10, 11), (11, 12), (12, 19), # ring
+        (0, 13), (13, 14), (14, 15), (15, 20), # thumb
+    ]
+    # Per-finger colour groups: (joint indices, RGB).  Wrist (joint 0) gets
+    # a neutral grey since it belongs to all chains.
+    MANO_FINGER_GROUPS = [
+        ([0],                  (0.50, 0.50, 0.50)),  # wrist        — grey
+        ([1, 2, 3, 16],        (0.22, 0.49, 0.72)),  # index        — blue
+        ([4, 5, 6, 17],        (0.30, 0.69, 0.29)),  # middle       — green
+        ([7, 8, 9, 18],        (1.00, 0.50, 0.00)),  # pinky        — orange
+        ([10, 11, 12, 19],     (0.60, 0.31, 0.64)),  # ring         — purple
+        ([13, 14, 15, 20],     (0.89, 0.10, 0.11)),  # thumb        — red
+    ]
+
     def __init__(
         self,
         meta: Dict,
@@ -63,6 +117,8 @@ class ReferenceTrajectory:
         object_scale: float = 1.0,
         object_grasp_bbox_scale: Optional[Tuple[float, float, float]] = None,
         object_need_vhacd: bool = False,
+        joints_world: Optional[torch.Tensor] = None,   # (T, 21, 3) optional
+        joints_local: Optional[torch.Tensor] = None,   # (T, 21, 3) optional
     ) -> None:
         self.meta = meta
         self.object_urdf_path = object_urdf_path
@@ -118,6 +174,18 @@ class ReferenceTrajectory:
         self.fingertip_goals = fingertip_goals.float()               # (T, K, 3)
         self.fingertip_local = fingertip_local.float()               # (T, K, 3)
 
+        # Optional 21-keypoint hand skeleton (MANO ordering — see docstring)
+        for arr in (joints_world, joints_local):
+            if arr is not None:
+                if arr.ndim != 3 or arr.shape != (T, 21, 3):
+                    raise ValueError(
+                        "joints_world / joints_local must be shape (T, 21, 3), "
+                        f"got {tuple(arr.shape)} (T={T})"
+                    )
+        self.joints_world = joints_world.float() if joints_world is not None else None
+        self.joints_local = joints_local.float() if joints_local is not None else None
+        self.has_skeleton = self.joints_world is not None
+
     # ------------------------------------------------------------------
     # construction helpers
     # ------------------------------------------------------------------
@@ -172,6 +240,18 @@ class ReferenceTrajectory:
                         f"strictly positive, got {grasp_bbox}"
                     )
 
+        # Optional 21-keypoint hand skeleton
+        joints_world = None
+        joints_local = None
+        if "joints_world" in hand:
+            joints_world = torch.as_tensor(
+                hand["joints_world"], dtype=torch.float32
+            )
+        if "joints_local" in hand:
+            joints_local = torch.as_tensor(
+                hand["joints_local"], dtype=torch.float32
+            )
+
         return cls(
             meta=d.get("meta", {}),
             object_start_pose=object_start,
@@ -183,6 +263,8 @@ class ReferenceTrajectory:
             object_scale=obj.get("scale", 1.0),
             object_grasp_bbox_scale=grasp_bbox,
             object_need_vhacd=bool(obj.get("need_vhacd", False)),
+            joints_world=joints_world,
+            joints_local=joints_local,
         )
 
     # ------------------------------------------------------------------
@@ -195,6 +277,10 @@ class ReferenceTrajectory:
         self.wrist_goals = self.wrist_goals.to(device)
         self.fingertip_goals = self.fingertip_goals.to(device)
         self.fingertip_local = self.fingertip_local.to(device)
+        if self.joints_world is not None:
+            self.joints_world = self.joints_world.to(device)
+        if self.joints_local is not None:
+            self.joints_local = self.joints_local.to(device)
         return self
 
     # ------------------------------------------------------------------

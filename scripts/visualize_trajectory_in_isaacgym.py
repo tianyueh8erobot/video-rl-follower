@@ -182,16 +182,24 @@ class TrajectoryViewer:
 
         # Object asset
         self._load_object_asset()
-        # Marker asset (a tiny sphere, used both for wrist + fingertips)
+        # Marker assets: smaller sphere for joints (incl. fingertips), bigger
+        # for the wrist root.  Tip markers get a slightly larger radius than
+        # interior joints for visibility.
         marker_options = gymapi.AssetOptions()
         marker_options.fix_base_link = True
         marker_options.disable_gravity = True
         self.wrist_marker_asset = self.gym.create_sphere(
-            self.sim, 0.012, marker_options
+            self.sim, 0.014, marker_options
         )
         self.ftip_marker_asset = self.gym.create_sphere(
-            self.sim, 0.008, marker_options
+            self.sim, 0.010, marker_options
         )
+        self.joint_marker_asset = self.gym.create_sphere(
+            self.sim, 0.006, marker_options
+        )
+
+        # Trajectory has skeleton iff joints_world is populated (21 joints).
+        self.has_skeleton = bool(getattr(self.traj, "has_skeleton", False))
 
         # Single env
         env_lower = gymapi.Vec3(-2, -2, 0)
@@ -258,7 +266,9 @@ class TrajectoryViewer:
             self.env, self.obj_asset, pose, "object", 0, 0
         )
 
-        # Wrist marker
+        # Wrist marker (always shown; for skeleton trajectories this is the
+        # same point as joints_world[:, 0] but kept as a separate marker for
+        # clarity since the env reward also uses palm_center_pos).
         pose_w = gymapi.Transform(
             p=gymapi.Vec3(*[float(x) for x in self.traj.wrist_goals[0, :3]])
         )
@@ -271,25 +281,52 @@ class TrajectoryViewer:
             gymapi.Vec3(0.0, 0.9, 0.2),
         )
 
-        # Fingertip markers
-        self.ftip_actors: List[int] = []
-        K = self.traj.num_fingertips
-        for k in range(K):
-            pose_f = gymapi.Transform(
-                p=gymapi.Vec3(*[float(x) for x in self.traj.fingertip_goals[0, k]])
-            )
-            actor = self.gym.create_actor(
-                self.env, self.ftip_marker_asset, pose_f, f"ftip_{k}", 0, 0
-            )
-            colour = _FINGER_COLOURS[k % len(_FINGER_COLOURS)]
-            self.gym.set_rigid_body_color(
-                self.env, actor, 0,
-                gymapi.MESH_VISUAL_AND_COLLISION,
-                gymapi.Vec3(*colour),
-            )
-            self.ftip_actors.append(actor)
-
-        # Cache the actor handles' rigid body indices (for set_actor_root_state).
+        if self.has_skeleton:
+            # Spawn 21 joint markers, color-coded per finger group.
+            self.joint_actors: List[int] = []
+            joint_colours = [(0.5, 0.5, 0.5)] * 21    # default grey
+            for joint_ids, rgb in self.traj.MANO_FINGER_GROUPS:
+                for j in joint_ids:
+                    joint_colours[j] = rgb
+            j0 = self.traj.joints_world[0]            # (21, 3)
+            for j in range(21):
+                pose_j = gymapi.Transform(
+                    p=gymapi.Vec3(*[float(x) for x in j0[j]])
+                )
+                # Tips (16-20) use a bigger marker for visibility.
+                asset = (self.ftip_marker_asset if j >= 16
+                         else self.joint_marker_asset)
+                actor = self.gym.create_actor(
+                    self.env, asset, pose_j,
+                    f"joint_{j:02d}_{self.traj.MANO_JOINT_ORDER[j]}",
+                    0, 0,
+                )
+                self.gym.set_rigid_body_color(
+                    self.env, actor, 0,
+                    gymapi.MESH_VISUAL_AND_COLLISION,
+                    gymapi.Vec3(*joint_colours[j]),
+                )
+                self.joint_actors.append(actor)
+            self.ftip_actors: List[int] = []  # unused in skeleton mode
+        else:
+            # Backward-compat: spawn only the K fingertip markers.
+            self.ftip_actors = []
+            K = self.traj.num_fingertips
+            for k in range(K):
+                pose_f = gymapi.Transform(
+                    p=gymapi.Vec3(*[float(x) for x in self.traj.fingertip_goals[0, k]])
+                )
+                actor = self.gym.create_actor(
+                    self.env, self.ftip_marker_asset, pose_f, f"ftip_{k}", 0, 0
+                )
+                colour = _FINGER_COLOURS[k % len(_FINGER_COLOURS)]
+                self.gym.set_rigid_body_color(
+                    self.env, actor, 0,
+                    gymapi.MESH_VISUAL_AND_COLLISION,
+                    gymapi.Vec3(*colour),
+                )
+                self.ftip_actors.append(actor)
+            self.joint_actors: List[int] = []
 
     # ------------------------------------------------------------------
 
@@ -343,10 +380,41 @@ class TrajectoryViewer:
         wp = self.traj.wrist_goals[t, :3].cpu().numpy()
         self._set_actor_pose(self.wrist_actor, wp)
 
-        # Fingertips
-        for k, actor in enumerate(self.ftip_actors):
-            fp = self.traj.fingertip_goals[t, k].cpu().numpy()
-            self._set_actor_pose(actor, fp)
+        if self.has_skeleton:
+            joints_t = self.traj.joints_world[t].cpu().numpy()         # (21, 3)
+            for j, actor in enumerate(self.joint_actors):
+                self._set_actor_pose(actor, joints_t[j])
+            self._draw_bones(joints_t)
+        else:
+            for k, actor in enumerate(self.ftip_actors):
+                fp = self.traj.fingertip_goals[t, k].cpu().numpy()
+                self._set_actor_pose(actor, fp)
+
+    def _draw_bones(self, joints: np.ndarray) -> None:
+        """Draw the 20 MANO bones as debug lines on the viewer.
+
+        The viewer accumulates lines across frames, so we ``clear_lines``
+        first.  In headless mode self.viewer is None and we no-op.
+        """
+        if self.viewer is None:
+            return
+        bone_pairs = self.traj.MANO_BONE_PAIRS                        # 20 pairs
+        # Build (num_lines, 6) vertices and (num_lines, 3) colors.
+        # Colour each bone with its CHILD joint's finger group colour.
+        joint_colours = [(0.5, 0.5, 0.5)] * 21
+        for joint_ids, rgb in self.traj.MANO_FINGER_GROUPS:
+            for j in joint_ids:
+                joint_colours[j] = rgb
+        verts = np.empty((len(bone_pairs), 6), dtype=np.float32)
+        colors = np.empty((len(bone_pairs), 3), dtype=np.float32)
+        for i, (a, b) in enumerate(bone_pairs):
+            verts[i, :3] = joints[a]
+            verts[i, 3:] = joints[b]
+            colors[i] = joint_colours[b]
+        self.gym.clear_lines(self.viewer)
+        self.gym.add_lines(
+            self.viewer, self.env, len(bone_pairs), verts, colors
+        )
 
     # ------------------------------------------------------------------
 
