@@ -230,7 +230,7 @@ class TrajectoryViewer:
         if urdf is None:
             print("[viz] trajectory has no urdf_path → using a 5 cm cube placeholder")
             opts = gymapi.AssetOptions()
-            opts.fix_base_link = False
+            opts.fix_base_link = True
             opts.disable_gravity = True
             self.obj_asset = self.gym.create_box(
                 self.sim, 0.05, 0.05, 0.05, opts
@@ -243,10 +243,11 @@ class TrajectoryViewer:
                 f"Trajectory's object URDF not found on disk: {urdf}"
             )
         opts = gymapi.AssetOptions()
-        # Keep the base movable so set_actor_rigid_body_states can teleport
-        # the root every frame.  Gravity off + no ground plane + zeroed
-        # velocities (in _set_actor_pose) makes physics effectively kinematic.
-        opts.fix_base_link = False
+        # Pin the base so PhysX never integrates the object.  We will still
+        # teleport its root via set_actor_rigid_body_states(STATE_ALL) every
+        # frame — IsaacGym honours direct state writes even on fixed-base
+        # actors for visualisation.
+        opts.fix_base_link = True
         opts.disable_gravity = True
         opts.collapse_fixed_joints = True
         opts.replace_cylinder_with_capsule = True
@@ -261,6 +262,14 @@ class TrajectoryViewer:
     # ------------------------------------------------------------------
 
     def _spawn_actors(self) -> None:
+        # Each actor goes into its own collision group with filter=-1 (all
+        # bits set) so PhysX never tries to resolve overlaps between actors.
+        # Without this, the 28 marker spheres + the object mesh, which all
+        # cluster within ~5 cm of the wrist, generate constant collision
+        # forces that PhysX would resolve by displacing the actors —
+        # producing the "object jitter" symptom reported by the user.
+        NO_COLL_FILTER = -1
+
         # Object actor (we will reset its root pose every frame)
         pose = gymapi.Transform()
         x, y, z = self.traj.object_start_pose[:3].tolist()
@@ -268,7 +277,7 @@ class TrajectoryViewer:
         pose.p = gymapi.Vec3(x, y, z)
         pose.r = gymapi.Quat(qx, qy, qz, qw)
         self.obj_actor = self.gym.create_actor(
-            self.env, self.obj_asset, pose, "object", 0, 0
+            self.env, self.obj_asset, pose, "object", 0, NO_COLL_FILTER
         )
 
         # Wrist marker (always shown; for skeleton trajectories this is the
@@ -278,7 +287,7 @@ class TrajectoryViewer:
             p=gymapi.Vec3(*[float(x) for x in self.traj.wrist_goals[0, :3]])
         )
         self.wrist_actor = self.gym.create_actor(
-            self.env, self.wrist_marker_asset, pose_w, "wrist_goal", 0, 0
+            self.env, self.wrist_marker_asset, pose_w, "wrist_goal", 0, NO_COLL_FILTER
         )
         self.gym.set_rigid_body_color(
             self.env, self.wrist_actor, 0,
@@ -304,7 +313,7 @@ class TrajectoryViewer:
                 actor = self.gym.create_actor(
                     self.env, asset, pose_j,
                     f"joint_{j:02d}_{self.traj.MANO_JOINT_ORDER[j]}",
-                    0, 0,
+                    0, NO_COLL_FILTER,
                 )
                 self.gym.set_rigid_body_color(
                     self.env, actor, 0,
@@ -322,7 +331,7 @@ class TrajectoryViewer:
                     p=gymapi.Vec3(*[float(x) for x in self.traj.fingertip_goals[0, k]])
                 )
                 actor = self.gym.create_actor(
-                    self.env, self.ftip_marker_asset, pose_f, f"ftip_{k}", 0, 0
+                    self.env, self.ftip_marker_asset, pose_f, f"ftip_{k}", 0, NO_COLL_FILTER
                 )
                 colour = _FINGER_COLOURS[k % len(_FINGER_COLOURS)]
                 self.gym.set_rigid_body_color(
@@ -476,7 +485,10 @@ class TrajectoryViewer:
                         self.playing = False
                 self._apply_frame(self.frame_idx)
 
-            self.gym.simulate(self.sim)
+            # Pure-kinematic render: we do NOT call gym.simulate() so PhysX
+            # never has a chance to integrate forces between teleport calls.
+            # Direct state writes via set_actor_rigid_body_states are still
+            # picked up by the renderer below.
             self.gym.fetch_results(self.sim, True)
             if self.viewer is not None:
                 self.gym.step_graphics(self.sim)
@@ -532,14 +544,13 @@ def main() -> int:
         try:
             scene_ok = True
             try:
-                # Apply the first, middle and last frames; step PhysX a couple
-                # of times after each to confirm no asset-load explosion.
+                # Apply the first, middle and last frames; we no longer call
+                # gym.simulate() because the visualizer is now pure-kinematic
+                # (see comment in run()).  Just confirm teleport doesn't raise.
                 for t in (0, traj.num_goals // 2, traj.num_goals - 1):
                     viewer.frame_idx = t
                     viewer._apply_frame(t)
-                    for _ in range(2):
-                        viewer.gym.simulate(viewer.sim)
-                        viewer.gym.fetch_results(viewer.sim, True)
+                    viewer.gym.fetch_results(viewer.sim, True)
                 print(f"  ✓ teleported through frames 0, mid, last "
                       f"({traj.num_goals} total)")
             except Exception as exc:
