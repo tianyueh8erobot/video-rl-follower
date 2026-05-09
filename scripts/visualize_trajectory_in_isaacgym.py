@@ -175,10 +175,12 @@ class TrajectoryViewer:
             raise RuntimeError("create_sim returned None — driver/CUDA issue?")
         self.sim = sim
 
-        # Ground plane
-        plane_params = gymapi.PlaneParams()
-        plane_params.normal = gymapi.Vec3(0, 0, 1)
-        self.gym.add_ground(self.sim, plane_params)
+        # NO ground plane.  GRAB demo coordinates put the object centred at
+        # the origin (z ≈ 2 mm), which would intersect a z=0 ground plane and
+        # cause PhysX to bounce the object every step against our per-frame
+        # teleport — that's the "mouse jumping" symptom.  Without a ground
+        # plane the visualisation is purely kinematic teleportation, which is
+        # exactly what we want for inspecting reference data.
 
         # Object asset
         self._load_object_asset()
@@ -241,6 +243,9 @@ class TrajectoryViewer:
                 f"Trajectory's object URDF not found on disk: {urdf}"
             )
         opts = gymapi.AssetOptions()
+        # Keep the base movable so set_actor_rigid_body_states can teleport
+        # the root every frame.  Gravity off + no ground plane + zeroed
+        # velocities (in _set_actor_pose) makes physics effectively kinematic.
         opts.fix_base_link = False
         opts.disable_gravity = True
         opts.collapse_fixed_joints = True

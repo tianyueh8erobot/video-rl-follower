@@ -51,6 +51,35 @@ _FINGERTIP_VERTS = {
 }
 _FINGERTIP_ORDER = ["thumb", "index", "middle", "ring", "pinky"]
 
+# Generic single-link URDF template that wraps a Wavefront mesh.  This is a
+# functional copy of ManipTrans/assets/obj_urdf_example.urdf with the mesh
+# filename made into a placeholder.  We embed it here so the processor does
+# not depend on a checked-out ManipTrans repo on disk just to grab one
+# 18-line XML file.
+_URDF_TEMPLATE = """<?xml version="1.0"?>
+<robot name="design">
+  <material name="obj_color">
+      <color rgba="1.0 0.423529411765 0.0392156862745 1.0"/>
+  </material>
+  <link name="base">
+    <visual>
+      <origin xyz="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="{mesh_file}" scale="1 1 1"/>
+      </geometry>
+      <material name="obj_color"/>
+    </visual>
+    <collision>
+      <origin xyz="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="{mesh_file}" scale="1 1 1"/>
+      </geometry>
+    </collision>
+  </link>
+</robot>
+"""
+
+
 # Standard 21-keypoint MANO ordering used throughout the repo
 # (see ReferenceTrajectory.MANO_JOINT_ORDER for the full table).
 # Indices 0..15 come from MANO's joint regressor applied to verts;
@@ -491,16 +520,20 @@ def _mock_trajectory(num_goals: int = 36) -> dict:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--maniptrans-root", default="/home/intel/Codes/ManipTrans",
-                   help="Used only when --demo-dir is not given.  Looks for "
-                        "<maniptrans_root>/data/grab_demo/102/.")
+                   help="ONLY used when --demo-dir is not given.  Looks for "
+                        "<maniptrans_root>/data/grab_demo/102/.  No longer "
+                        "required for URDF generation — that is now handled by "
+                        "an embedded URDF template.")
     p.add_argument("--demo-dir", default=None,
                    help="Direct path to the folder containing 102_sv_dict.npy "
                         "and 102_obj.obj.  Overrides --maniptrans-root.")
     p.add_argument("--obj-urdf", default=None,
                    help="Path to the object URDF.  If omitted, defaults to "
-                        "<demo-dir>/102_obj.urdf, which the script will "
-                        "auto-create from the bundled assets/obj_urdf_example.urdf "
-                        "if missing.")
+                        "<demo-dir>/102_obj.urdf and will be auto-generated "
+                        "from the embedded URDF template if missing.")
+    p.add_argument("--obj-mesh-name", default="102_obj.obj",
+                   help="Mesh filename (relative to the URDF dir) referenced "
+                        "by the auto-generated URDF.  Default 102_obj.obj.")
     p.add_argument("--data-idx", default="g0")
     p.add_argument("--src-fps", type=float, default=60.0)
     p.add_argument("--target-fps", type=float, default=3.0)
@@ -564,23 +597,24 @@ def main() -> int:
             urdf = str(
                 Path(args.maniptrans_root) / "data" / "grab_demo" / "102" / "102_obj.urdf"
             )
-        # If the URDF is missing but the bundled example URDF exists, copy
-        # it into place so the env can load the same mesh that ships with
-        # the demo.  Only safe because the example URDF is generic
-        # (filename="102_obj.obj" relative reference).
+        # If the URDF is missing, generate one in-place from our embedded
+        # template, pointing at the .obj mesh that lives next to the URDF.
+        # Default mesh filename is 102_obj.obj (matches GRAB demo); user can
+        # override with --obj-mesh-name.
         if not Path(urdf).is_file():
-            example = Path(args.maniptrans_root) / "assets" / "obj_urdf_example.urdf"
-            if example.is_file():
-                Path(urdf).parent.mkdir(parents=True, exist_ok=True)
-                import shutil as _sh
-                _sh.copy2(example, urdf)
-                print(f"[info] copied bundled URDF → {urdf}")
-            else:
+            urdf_path = Path(urdf)
+            mesh_file = args.obj_mesh_name
+            mesh_full = urdf_path.parent / mesh_file
+            if not mesh_full.is_file():
                 raise FileNotFoundError(
-                    f"Object URDF not found at {urdf} and the bundled "
-                    f"example URDF is missing too ({example}).  Pass "
-                    "--obj-urdf <path> explicitly."
+                    f"Object URDF will be auto-generated but the referenced "
+                    f"mesh {mesh_full} does not exist.  Either drop the .obj "
+                    f"file next to the URDF or pass --obj-mesh-name "
+                    f"<filename> if your mesh has a different name."
                 )
+            urdf_path.parent.mkdir(parents=True, exist_ok=True)
+            urdf_path.write_text(_URDF_TEMPLATE.format(mesh_file=mesh_file))
+            print(f"[info] generated URDF → {urdf} (mesh: {mesh_file})")
         # GRAB g0 is a teapot mesh — a sensible default grasp bbox is ~0.10 m
         # along the long axis.  User can override post-hoc by editing the JSON.
         bbox = (0.10, 0.05, 0.05)
