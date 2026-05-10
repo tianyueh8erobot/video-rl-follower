@@ -487,31 +487,55 @@ class VideoRLFollower(SimToolReal):
 
         SimToolReal builds ``self.rigid_body_name_to_idx["robot/<name>"]``
         during actor creation (simtoolreal/env.py:2014-2019), giving the
-        env-domain rigid-body slot for every Sharpa link by name.  We use that
-        directly — no actor handles needed.
+        env-domain rigid-body slot for every Sharpa link by name.
 
-        We REQUIRE all 28 Sharpa body_names to exist in the URDF (otherwise
-        the to_hand mapping is broken for the missing link and the resulting
-        distance term would be biased).  Raises a clear error rather than
-        silently substituting the wrist as a proxy.
+        The shipped Kuka+Sharpa URDF
+        (assets/urdf/kuka_sharpa_description/iiwa14_right_sharpa_adjusted_restricted.urdf)
+        has ``collapse_fixed_joints=True`` applied at load time, which fuses
+        6 fixed-joined links into their parents:
+          - right_hand_C_MC          → fused into iiwa14_link_7
+          - right_<finger>_fingertip → fused into right_<finger>_DP
+        We accept these substitutions explicitly so R_imit can still run on
+        the unmodified asset.  The DP→fingertip substitution is mildly
+        biased (the DP origin is the proximal-end joint, not the tip vertex
+        — ~3-5 cm off depending on finger), but the alternative is to
+        disable R_imit entirely or rebuild the URDF.
         """
-        idx_map = self.rigid_body_name_to_idx          # built by SimToolReal
+        # Remap missing-after-collapse names → present-in-URDF names.
+        FUSED_FALLBACKS = {
+            "right_hand_C_MC":         "iiwa14_link_7",
+            "right_thumb_fingertip":   "right_thumb_DP",
+            "right_index_fingertip":   "right_index_DP",
+            "right_middle_fingertip":  "right_middle_DP",
+            "right_ring_fingertip":    "right_ring_DP",
+            "right_pinky_fingertip":   "right_pinky_DP",
+        }
+        idx_map = self.rigid_body_name_to_idx
         handles = []
-        missing = []
+        unresolvable = []
+        substituted = []
         for name in SHARPA_BODY_NAMES:
             key = "robot/" + name
-            if key not in idx_map:
-                missing.append(name)
-                handles.append(-1)
-            else:
+            if key in idx_map:
                 handles.append(int(idx_map[key]))
-        if missing:
+                continue
+            fb = FUSED_FALLBACKS.get(name)
+            if fb is not None and ("robot/" + fb) in idx_map:
+                handles.append(int(idx_map["robot/" + fb]))
+                substituted.append((name, fb))
+                continue
+            unresolvable.append(name)
+            handles.append(-1)
+        if unresolvable:
             raise RuntimeError(
                 "[VideoRLFollower] R_imit setup failed: the loaded robot "
-                f"URDF is missing {len(missing)} Sharpa body links required "
-                f"by the dex2hand mapping: {missing}.  Either fix the URDF "
+                f"URDF is missing {len(unresolvable)} Sharpa body links required "
+                f"by the dex2hand mapping: {unresolvable}.  Either fix the URDF "
                 "or set imitRewardScale.enable=0 to disable R_imit."
             )
+        if substituted:
+            print(f"[VideoRLFollower] R_imit substituted "
+                  f"{len(substituted)} fused-joint links: {substituted}")
         self._imit_link_handles = handles                  # length 28
         self._imit_link_handles_t = torch.tensor(
             handles, device=self.device, dtype=torch.long
