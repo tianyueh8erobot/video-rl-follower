@@ -230,14 +230,13 @@ class VideoRLFollower(SimToolReal):
         ]
         cfg["env"]["maxConsecutiveSuccesses"] = self._trajectory.num_goals
 
-        # ----- Trajectory-driven object start pose (always honoured) -----
-        # The trajectory's first object pose is the intended initial state of
-        # the manipulated object, irrespective of whether we load its URDF or
-        # fall back to procedural primitives.  Set this BEFORE super().__init__
-        # so the base ``_object_start_pose`` honours it.
-        cfg["env"]["objectStartPose"] = list(
-            self._trajectory.object_start_pose.tolist()
-        )
+        # NOTE: do NOT seed cfg.env.objectStartPose from the trajectory's
+        # frame-0 pose.  Per SimToolReal paper Section III.B, the object
+        # starts on the table at episode reset (so the policy learns to
+        # grasp first).  The trajectory drives the GOAL sequence via
+        # sub_goal_idx, not the init pose.  Letting cfg.env.objectStartPose
+        # stay at its yaml default (or be sampled by SimToolReal's
+        # _object_start_pose) keeps that semantics.
 
         # ----- Trajectory-driven object asset (URDF) selection -----
         self._use_trajectory_object = bool(
@@ -587,39 +586,18 @@ class VideoRLFollower(SimToolReal):
         self._wrist_goal[env_ids] = self._trajectory.wrist_goals[idx]
         self._fingertip_goal_local[env_ids] = self._trajectory.fingertip_local[idx]
 
-    def reset_object_pose(
-        self, env_ids: Tensor, reset_buf_idxs=None, tensor_reset: bool = True
-    ) -> None:
-        """Mirror ManipTrans ``_reset_default`` (lines 1109-1118 in
-        /home/intel/Codes/ManipTrans/maniptrans_envs/lib/envs/tasks/dexhandmanip_sh.py)
-        for the manipulated object: at episode start, place the object at
-        the trajectory's current sub_goal_idx pose with zero velocity (we
-        don't ship per-frame velocity in the JSON yet).
-
-        Replaces SimToolReal's parent ``reset_object_pose`` which:
-          • picks a random table_z within ±tableResetZRange
-          • adds horizontal random noise resetPositionNoiseX/Y to obj
-          • randomizes object rotation if randomizeObjectRotation
-          • zeros velocity
-        — none of which match ManipTrans's "place at trajectory frame"
-        recipe, and all of which break our trajectory's exact mujoco2gym
-        alignment.
-
-        We still call super so SimToolReal-internal bookkeeping (table
-        pose write, closest_keypoint_max_dist reset, etc.) runs, then
-        OVERWRITE the object root state with our trajectory frame.
-        """
-        super().reset_object_pose(
-            env_ids, reset_buf_idxs=reset_buf_idxs, tensor_reset=tensor_reset
-        )
-        if (len(env_ids) > 0 and reset_buf_idxs is None and tensor_reset
-                and hasattr(self, "sub_goal_idx")):
-            obj_indices = self.object_indices[env_ids]
-            idx = self.sub_goal_idx[env_ids]
-            obj_pose = self._trajectory.object_goals[idx]            # (E, 7)
-            self.root_state_tensor[obj_indices, :3]   = obj_pose[:, :3]
-            self.root_state_tensor[obj_indices, 3:7]  = obj_pose[:, 3:7]
-            self.root_state_tensor[obj_indices, 7:13] = 0.0           # zero vel
+    # NOTE: We intentionally do NOT override reset_object_pose.  Per the
+    # SimToolReal paper (arXiv:2602.16863, Section III.B): "we place a
+    # randomly selected object on the table in a random pose and initialize
+    # the robot in a randomized joint configuration ... The robot must first
+    # learn to grasp the object from the flat table surface".  ManipTrans's
+    # alternative — placing the object at trajectory[seq_idx] — only works
+    # because their floating-base dexhand can be teleported to opt_wrist_pos
+    # to grip the object at episode start.  Our SimToolReal-Kuka robot can't
+    # do that without arm IK (deferred to V2), so the SimToolReal recipe is
+    # the right one: object on table, policy learns to grasp first.  The
+    # trajectory drives the GOAL sequence (handled by _reset_target →
+    # sub_goal_idx), not the initial object pose.
 
     def _reset_target(
         self,
