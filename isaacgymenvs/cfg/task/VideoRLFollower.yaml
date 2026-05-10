@@ -113,17 +113,22 @@ env:
 
   controlFrequencyInv: 1 # 60 Hz
 
-  resetPositionNoiseX: 0.1
-  resetPositionNoiseY: 0.1
-  resetPositionNoiseZ: 0.02
-  randomizeObjectRotation: True
+  # ── Zero SimToolReal randomization for the trajectory-driven object.
+  # Our subclass override of reset_object_pose places the object at the
+  # trajectory's sub_goal_idx pose exactly (mirroring ManipTrans
+  # _reset_default).  Random noise / rotation would desync the object
+  # from the goal pose computed offline by tools/process_maniptrans_trajectory.py.
+  resetPositionNoiseX: 0.0
+  resetPositionNoiseY: 0.0
+  resetPositionNoiseZ: 0.0
+  randomizeObjectRotation: False
   resetDofPosRandomIntervalFingers: 0.1
   resetDofPosRandomIntervalArm: 0.1
   resetDofVelRandomInterval: 0.5
 
   # Table reset settings
   tableResetZ: 0.38
-  tableResetZRange: 0.01
+  tableResetZRange: 0.0    # zeroed: trajectory was preprocessed assuming fixed table_z=0.415
   tableObjectZOffset: 0.25
 
   # Random forces applied to the object

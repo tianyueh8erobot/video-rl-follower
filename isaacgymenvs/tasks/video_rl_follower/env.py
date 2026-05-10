@@ -587,6 +587,40 @@ class VideoRLFollower(SimToolReal):
         self._wrist_goal[env_ids] = self._trajectory.wrist_goals[idx]
         self._fingertip_goal_local[env_ids] = self._trajectory.fingertip_local[idx]
 
+    def reset_object_pose(
+        self, env_ids: Tensor, reset_buf_idxs=None, tensor_reset: bool = True
+    ) -> None:
+        """Mirror ManipTrans ``_reset_default`` (lines 1109-1118 in
+        /home/intel/Codes/ManipTrans/maniptrans_envs/lib/envs/tasks/dexhandmanip_sh.py)
+        for the manipulated object: at episode start, place the object at
+        the trajectory's current sub_goal_idx pose with zero velocity (we
+        don't ship per-frame velocity in the JSON yet).
+
+        Replaces SimToolReal's parent ``reset_object_pose`` which:
+          • picks a random table_z within ±tableResetZRange
+          • adds horizontal random noise resetPositionNoiseX/Y to obj
+          • randomizes object rotation if randomizeObjectRotation
+          • zeros velocity
+        — none of which match ManipTrans's "place at trajectory frame"
+        recipe, and all of which break our trajectory's exact mujoco2gym
+        alignment.
+
+        We still call super so SimToolReal-internal bookkeeping (table
+        pose write, closest_keypoint_max_dist reset, etc.) runs, then
+        OVERWRITE the object root state with our trajectory frame.
+        """
+        super().reset_object_pose(
+            env_ids, reset_buf_idxs=reset_buf_idxs, tensor_reset=tensor_reset
+        )
+        if (len(env_ids) > 0 and reset_buf_idxs is None and tensor_reset
+                and hasattr(self, "sub_goal_idx")):
+            obj_indices = self.object_indices[env_ids]
+            idx = self.sub_goal_idx[env_ids]
+            obj_pose = self._trajectory.object_goals[idx]            # (E, 7)
+            self.root_state_tensor[obj_indices, :3]   = obj_pose[:, :3]
+            self.root_state_tensor[obj_indices, 3:7]  = obj_pose[:, 3:7]
+            self.root_state_tensor[obj_indices, 7:13] = 0.0           # zero vel
+
     def _reset_target(
         self,
         env_ids: Tensor,
@@ -655,6 +689,21 @@ class VideoRLFollower(SimToolReal):
             tensor_reset=tensor_reset,
         )
 
+        # ★ KNOWN GAP (deferred to V2): ManipTrans Stage-2
+        # (dexhandmanip_sh.py:1093-1100) sets the dexhand's floating-base
+        # ROOT to opt_wrist_pos[seq_idx] / opt_wrist_rot[seq_idx] so the
+        # hand starts gripping the object.  We have a Kuka arm — the
+        # dexhand's "wrist" is iiwa14_link_7 — so directly setting the
+        # wrist pose requires solving 7-DoF arm IK to opt_wrist_pos.  We
+        # don't currently do this: the arm is left at SimToolReal's
+        # randomized default DOFs from super().reset_idx, which puts the
+        # wrist FAR from the trajectory's expected wrist pose.  Effects:
+        #   • The hand's pre-grasp shape (from opt_dof_pos) is correct
+        #     but at the wrong location → it can't grip the object.
+        #   • The object falls under gravity from the trajectory pose.
+        #   • RL must learn to drive the arm to within reach.
+        # Mitigation in flight: object_max_velocity caps + ManipTrans
+        # density/friction prevent PhysX explosion when object falls.
         # Step 3: ManipTrans-style hand-DOF warm-start.
         if (self.use_retarget_dof_init
                 and self._cached_reset_seq_idx is not None
