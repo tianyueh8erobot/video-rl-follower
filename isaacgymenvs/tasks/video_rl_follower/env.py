@@ -735,6 +735,61 @@ class VideoRLFollower(SimToolReal):
         )
         return r_imit
 
+    def _write_diagnostic_metrics(self, is_success: Tensor, r_imit: Tensor) -> None:
+        """Push per-step training/eval diagnostics into ``self.extras`` so
+        rl_games surfaces them via wandb/tensorboard.  Cheap (no extra
+        forward pass — reuses tensors already computed for R_imit)."""
+        # Object 6D distance to current sub-goal
+        cur_obj_pos  = self.object_state[:, :3]                            # (N, 3)
+        cur_obj_quat = self.object_state[:, 3:7]
+        idx          = self.sub_goal_idx
+        goal_obj     = self._trajectory.object_goals[idx]                  # (N, 7)
+        d_obj_pos = (cur_obj_pos - goal_obj[:, :3]).norm(dim=-1)
+        d_obj_rot = _quat_geodesic_angle_xyzw(cur_obj_quat, goal_obj[:, 3:7])
+
+        # Wrist (palm-center) distance to MANO wrist target
+        d_wrist_pos = (self.palm_center_pos - self._wrist_goal[:, :3]).norm(dim=-1)
+        d_wrist_rot = _quat_geodesic_angle_xyzw(
+            self._palm_state[:, 3:7], self._wrist_goal[:, 3:7]
+        )
+
+        # Mean fingertip-to-MANO-tip distance (Sharpa thumb/index/.../pinky)
+        if self._imit_active:
+            rb_t = self._rigid_body_state_tensor.view(self.num_envs, -1, 13)
+            actual_28 = rb_t[:, self._imit_link_handles_t, :3]             # (N, 28, 3)
+            tip_idx_in_27 = torch.tensor(
+                # subtract 1 because we skip wrist=body[0]
+                [SHARPA_WEIGHT_IDX[k][0] - 1 for k in
+                 ("thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip")],
+                device=self.device, dtype=torch.long,
+            )
+            sharpa_tips = actual_28[:, 1:][:, tip_idx_in_27, :]            # (N, 5, 3)
+            joints_world = self._trajectory.joints_world[idx]              # (N, 21, 3)
+            mano_tips = joints_world[:, [20, 16, 17, 19, 18], :]            # thumb/index/mid/ring/pinky tip
+            d_ftip = (sharpa_tips - mano_tips).norm(dim=-1).mean(dim=-1)   # (N,)
+        else:
+            d_ftip = torch.zeros(self.num_envs, device=self.device)
+
+        # Sub-goal progress (mean idx + max so we know coverage)
+        T = self._trajectory.num_goals
+        progress_frac = self.sub_goal_idx.float() / max(T - 1, 1)
+
+        # Stash scalars for logging — rl_games picks these up.
+        self.extras.setdefault("scalars", {}).update(
+            d_obj_pos_cm        = (d_obj_pos.mean() * 100.0).item(),
+            d_obj_rot_deg       = (d_obj_rot.mean() * 180.0 / 3.14159265).item(),
+            d_wrist_pos_cm      = (d_wrist_pos.mean() * 100.0).item(),
+            d_wrist_rot_deg     = (d_wrist_rot.mean() * 180.0 / 3.14159265).item(),
+            d_fingertip_cm      = (d_ftip.mean() * 100.0).item(),
+            r_imit_mean         = r_imit.mean().item(),
+            r_total_mean        = self.rew_buf.mean().item(),
+            sub_goal_idx_mean   = self.sub_goal_idx.float().mean().item(),
+            sub_goal_idx_max    = self.sub_goal_idx.max().item(),
+            sub_goal_progress   = progress_frac.mean().item(),
+            success_rate_step   = is_success.float().mean().item(),
+            successes_per_env   = self.successes.float().mean().item(),
+        )
+
     def _hand_pose_reward(self) -> Tuple[Tensor, Tensor, Tensor]:
         """Compute three hand-pose reward terms, each in [0, 1] before scaling.
 
@@ -822,6 +877,11 @@ class VideoRLFollower(SimToolReal):
                     )
 
         self.rew_buf[:] = combined
+
+        # 4c) Diagnostic metrics (logged via self.extras → rl_games → wandb).
+        #     Cheap to compute; off via cfg.env.disableExtraMetrics if needed.
+        if not bool(self.cfg["env"].get("disableExtraMetrics", False)):
+            self._write_diagnostic_metrics(is_success, r_imit)
 
         # 5) ★ Phase fix (Codex round 2): advance sub_goal_idx for SUCCESS envs
         #    NOW so populate_obs_and_states_buffers (which runs immediately
