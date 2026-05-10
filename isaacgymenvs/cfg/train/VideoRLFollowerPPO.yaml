@@ -14,7 +14,11 @@ params:
     space:
       continuous:
         mu_activation: None
-        sigma_activation: None
+        # exp wrap ensures sigma > 0 even after Adam pushes the param
+        # negative.  Without this, fixed_sigma in {'fixed', 'coef_cond'}
+        # passes the raw param through identity → torch.normal crashes
+        # with "std >= 0.0" within ~10 PPO updates.  Found by Codex audit.
+        sigma_activation: exp
         mu_init:
           name: default
         sigma_init:
