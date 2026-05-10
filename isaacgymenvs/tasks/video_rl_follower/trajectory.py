@@ -127,6 +127,8 @@ class ReferenceTrajectory:
         # initialisation hint or as a soft regulariser; stored but not
         # required for the position-based reward.
         dex_dof_pos: Optional[torch.Tensor] = None,
+        dex_wrist_pos: Optional[torch.Tensor] = None,
+        dex_wrist_rot: Optional[torch.Tensor] = None,
         # Per-link names (so the env knows which q maps to which body)
         dex_link_names: Optional[List[str]] = None,
     ) -> None:
@@ -215,6 +217,8 @@ class ReferenceTrajectory:
             dex_dof_pos.float() if dex_dof_pos is not None else None
         )
         self.dex_link_names = list(dex_link_names) if dex_link_names is not None else None
+        self.dex_wrist_pos = dex_wrist_pos.float() if dex_wrist_pos is not None else None
+        self.dex_wrist_rot = dex_wrist_rot.float() if dex_wrist_rot is not None else None
         self.has_retargeted = self.dex_links_world is not None
 
     # ------------------------------------------------------------------
@@ -287,6 +291,8 @@ class ReferenceTrajectory:
         dex_links_world = None
         dex_dof_pos = None
         dex_link_names = None
+        dex_wrist_pos = None
+        dex_wrist_rot = None
         if "dex" in d:
             dex = d["dex"]
             if "links_world" in dex:
@@ -295,6 +301,10 @@ class ReferenceTrajectory:
                 dex_dof_pos = torch.as_tensor(dex["dof_pos"], dtype=torch.float32)
             if "link_names" in dex:
                 dex_link_names = list(dex["link_names"])
+            if "wrist_pos" in dex:
+                dex_wrist_pos = torch.as_tensor(dex["wrist_pos"], dtype=torch.float32)
+            if "wrist_rot" in dex:
+                dex_wrist_rot = torch.as_tensor(dex["wrist_rot"], dtype=torch.float32)
 
         return cls(
             meta=d.get("meta", {}),
@@ -312,6 +322,8 @@ class ReferenceTrajectory:
             dex_links_world=dex_links_world,
             dex_dof_pos=dex_dof_pos,
             dex_link_names=dex_link_names,
+            dex_wrist_pos=dex_wrist_pos,
+            dex_wrist_rot=dex_wrist_rot,
         )
 
     # ------------------------------------------------------------------

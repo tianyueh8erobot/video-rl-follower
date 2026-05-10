@@ -1,0 +1,18 @@
+{
+  "round": 3,
+  "threadId": null,
+  "status": "completed",
+  "difficulty": "medium",
+  "last_score": 7.0,
+  "last_verdict": "almost ready",
+  "pending_experiments": [],
+  "deferred_followups": [
+    "Visible goal actor refresh: copy SimToolReal's root_state_tensor[goal_object_indices] write into our _reset_target (visualization-only, training is correct).",
+    "Checkpoint serialization: override save/load_states to include sub_goal_idx, _wrist_goal, _fingertip_goal_local (only matters when resuming mid-episode from a checkpoint — not in v1 training)."
+  ],
+  "score_progression": [4.0, 6.0, 7.0],
+  "verdict_progression": ["not ready", "not ready", "almost ready"],
+  "fixes_applied": 9,
+  "rounds": 3,
+  "timestamp": "2026-05-10T17:55:00"
+}

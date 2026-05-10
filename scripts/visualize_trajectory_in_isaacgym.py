@@ -151,12 +151,25 @@ class TrajectoryViewer:
         headless: bool = False,
         hz: float = 5.0,
         loop: bool = True,
+        overlay_pkl: str = None,
+        overlay_urdf: str = None,
+        overlay_color: str = "0.30,0.85,0.45",
+        show_mano: bool = True,
+        show_sharpa: bool = True,
     ) -> None:
         self.traj = traj
         self.hz = float(hz)
         self.loop = bool(loop)
         self.frame_idx = 0
         self.playing = True
+        # Overlay = a SECOND floating-base hand loaded from a separate retarget
+        # pkl (e.g., Inspire) so we can compare two embodiments on the same
+        # MANO trajectory.  None disables.
+        self._overlay_pkl_path = overlay_pkl
+        self._overlay_urdf_path = overlay_urdf
+        self._overlay_color = tuple(float(c) for c in overlay_color.split(","))
+        self._show_mano = bool(show_mano)
+        self._show_sharpa = bool(show_sharpa)
 
         self.gym = gymapi.acquire_gym()
 
@@ -184,6 +197,10 @@ class TrajectoryViewer:
 
         # Object asset
         self._load_object_asset()
+        # Sharpa hand asset (only if trajectory has dex.* fields)
+        self._load_sharpa_asset()
+        # Optional overlay hand (e.g., Inspire) from a separate pkl
+        self._load_overlay_asset()
         # Marker assets: smaller sphere for joints (incl. fingertips), bigger
         # for the wrist root.  Tip markers get a slightly larger radius than
         # interior joints for visibility.
@@ -261,6 +278,86 @@ class TrajectoryViewer:
 
     # ------------------------------------------------------------------
 
+    def _load_sharpa_asset(self) -> None:
+        """Load floating-base Sharpa right-hand URDF as a kinematic asset.
+
+        We treat Sharpa as a render-only puppet: floating root drives the wrist
+        each frame, 22 DoF positions drive the fingers.  No physics integration.
+        """
+        self.sharpa_asset = None
+        if not self._show_sharpa:
+            return
+        if self.traj.dex_dof_pos is None or self.traj.dex_wrist_pos is None:
+            return
+        urdf_candidates = [
+            "/home/intel/Codes/ManipTrans/maniptrans_envs/assets/sharpa/right_sharpa_wave.urdf",
+        ]
+        urdf = next((p for p in urdf_candidates if os.path.isfile(p)), None)
+        if urdf is None:
+            print("[viz] Sharpa URDF not found — skipping floating-hand visual")
+            return
+        opts = gymapi.AssetOptions()
+        # Floating base: do NOT fix.  We will set root state via tensor write
+        # every frame, with disable_gravity to prevent integration drift.
+        opts.fix_base_link = False
+        opts.disable_gravity = True
+        opts.collapse_fixed_joints = False    # keep all 28 links visible
+        opts.flip_visual_attachments = False
+        opts.armature = 0.0
+        # Drive mode: kinematic position targets only.
+        opts.default_dof_drive_mode = gymapi.DOF_MODE_POS
+        opts.use_mesh_materials = True
+        self.sharpa_asset = self.gym.load_asset(
+            self.sim, os.path.dirname(urdf), os.path.basename(urdf), opts
+        )
+        n_dof = self.gym.get_asset_dof_count(self.sharpa_asset)
+        n_links = self.gym.get_asset_rigid_body_count(self.sharpa_asset)
+        print(f"[viz] loaded Sharpa URDF: {urdf}  ({n_links} links, {n_dof} DoF)")
+
+    # ------------------------------------------------------------------
+
+    def _load_overlay_asset(self) -> None:
+        """Load a second floating-base hand URDF + its retarget pkl.
+
+        The pkl must have the same ManipTrans schema as Sharpa's:
+          opt_wrist_pos (T, 3), opt_wrist_rot (T, 3), opt_dof_pos (T, n_dof).
+        """
+        self.overlay_asset = None
+        self.overlay_pkl_data = None
+        if self._overlay_pkl_path is None or self._overlay_urdf_path is None:
+            return
+        if not os.path.isfile(self._overlay_urdf_path):
+            print(f"[viz] overlay URDF not found: {self._overlay_urdf_path}")
+            return
+        if not os.path.isfile(self._overlay_pkl_path):
+            print(f"[viz] overlay pkl not found: {self._overlay_pkl_path}")
+            return
+        import pickle as _pickle
+        with open(self._overlay_pkl_path, "rb") as f:
+            self.overlay_pkl_data = _pickle.load(f)
+        opts = gymapi.AssetOptions()
+        opts.fix_base_link = False
+        opts.disable_gravity = True
+        opts.collapse_fixed_joints = False
+        opts.flip_visual_attachments = False
+        opts.armature = 0.0
+        opts.default_dof_drive_mode = gymapi.DOF_MODE_POS
+        opts.use_mesh_materials = True
+        self.overlay_asset = self.gym.load_asset(
+            self.sim,
+            os.path.dirname(self._overlay_urdf_path),
+            os.path.basename(self._overlay_urdf_path),
+            opts,
+        )
+        n_dof = self.gym.get_asset_dof_count(self.overlay_asset)
+        n_links = self.gym.get_asset_rigid_body_count(self.overlay_asset)
+        T = self.overlay_pkl_data["opt_wrist_pos"].shape[0]
+        n_dof_pkl = self.overlay_pkl_data["opt_dof_pos"].shape[1]
+        print(f"[viz] loaded overlay URDF: {self._overlay_urdf_path}  "
+              f"({n_links} links, {n_dof} DoF; pkl T={T} dof={n_dof_pkl})")
+
+    # ------------------------------------------------------------------
+
     def _spawn_actors(self) -> None:
         # Each actor goes into its own collision group with filter=-1 (all
         # bits set) so PhysX never tries to resolve overlaps between actors.
@@ -295,7 +392,7 @@ class TrajectoryViewer:
             gymapi.Vec3(0.0, 0.9, 0.2),
         )
 
-        if self.has_skeleton:
+        if self.has_skeleton and self._show_mano:
             # Spawn 21 joint markers, color-coded per finger group.
             self.joint_actors: List[int] = []
             joint_colours = [(0.5, 0.5, 0.5)] * 21    # default grey
@@ -307,7 +404,6 @@ class TrajectoryViewer:
                 pose_j = gymapi.Transform(
                     p=gymapi.Vec3(*[float(x) for x in j0[j]])
                 )
-                # Tips (16-20) use a bigger marker for visibility.
                 asset = (self.ftip_marker_asset if j >= 16
                          else self.joint_marker_asset)
                 actor = self.gym.create_actor(
@@ -321,10 +417,117 @@ class TrajectoryViewer:
                     gymapi.Vec3(*joint_colours[j]),
                 )
                 self.joint_actors.append(actor)
-            self.ftip_actors: List[int] = []  # unused in skeleton mode
         else:
-            # Backward-compat: spawn only the K fingertip markers.
-            self.ftip_actors = []
+            self.joint_actors: List[int] = []
+        self.ftip_actors: List[int] = []  # MANO mode never spawns ftip-only
+
+        # --------------------------------------------------------------
+        # Sharpa + Overlay always run regardless of MANO visibility
+        # --------------------------------------------------------------
+        if True:
+            # ----------------------------------------------------------
+            # Sharpa floating-base hand actor (only if asset loaded)
+            # ----------------------------------------------------------
+            if self.sharpa_asset is not None:
+                # Spawn at frame 0 wrist pose (we then teleport every frame)
+                wp0 = self.traj.dex_wrist_pos[0].cpu().numpy()
+                # dex_wrist_rot is axis-angle (T, 3).  Convert frame 0.
+                from scipy.spatial.transform import Rotation as _R
+                aa0 = self.traj.dex_wrist_rot[0].cpu().numpy()
+                q0 = _R.from_rotvec(aa0).as_quat()      # xyzw
+                pose_s = gymapi.Transform()
+                pose_s.p = gymapi.Vec3(*[float(x) for x in wp0])
+                pose_s.r = gymapi.Quat(*[float(x) for x in q0])
+                self.sharpa_actor = self.gym.create_actor(
+                    self.env, self.sharpa_asset, pose_s,
+                    "sharpa_hand", 0, NO_COLL_FILTER,
+                )
+                # Init DOF state from frame 0 retargeted angles.
+                dof_states = self.gym.get_actor_dof_states(
+                    self.env, self.sharpa_actor, gymapi.STATE_ALL
+                )
+                dof_pos0 = self.traj.dex_dof_pos[0].cpu().numpy()
+                # Be defensive about DOF count — the URDF may have a different
+                # ordering than dex_dof_pos.  Take min and warn if mismatch.
+                n_dof_urdf = self.gym.get_asset_dof_count(self.sharpa_asset)
+                n_dof_traj = dof_pos0.shape[0]
+                if n_dof_urdf != n_dof_traj:
+                    print(f"[viz] WARN: Sharpa URDF has {n_dof_urdf} DoF but "
+                          f"trajectory has {n_dof_traj} — using min({n_dof_urdf},{n_dof_traj})")
+                K = min(n_dof_urdf, n_dof_traj)
+                for i in range(K):
+                    dof_states["pos"][i] = float(dof_pos0[i])
+                    dof_states["vel"][i] = 0.0
+                self.gym.set_actor_dof_states(
+                    self.env, self.sharpa_actor, dof_states, gymapi.STATE_ALL
+                )
+                # Also set DOF position TARGETS (so any control loop driving
+                # them snaps to the same value).
+                self.gym.set_actor_dof_position_targets(
+                    self.env, self.sharpa_actor, dof_pos0[:K].astype(np.float32)
+                )
+                self._sharpa_n_dof = K
+                # Tint Sharpa visuals so they're distinguishable from the MANO
+                # markers (light blue).
+                n_links = self.gym.get_asset_rigid_body_count(self.sharpa_asset)
+                for li in range(n_links):
+                    self.gym.set_rigid_body_color(
+                        self.env, self.sharpa_actor, li,
+                        gymapi.MESH_VISUAL,
+                        gymapi.Vec3(0.30, 0.55, 0.85),
+                    )
+            else:
+                self.sharpa_actor = None
+                self._sharpa_n_dof = 0
+
+            # ----------------------------------------------------------
+            # Overlay floating-base hand actor (Inspire / Shadow / etc.)
+            # ----------------------------------------------------------
+            if self.overlay_asset is not None:
+                from scipy.spatial.transform import Rotation as _R
+                wp0 = np.asarray(self.overlay_pkl_data["opt_wrist_pos"][0])
+                aa0 = np.asarray(self.overlay_pkl_data["opt_wrist_rot"][0])
+                q0 = _R.from_rotvec(aa0).as_quat()
+                pose_o = gymapi.Transform()
+                pose_o.p = gymapi.Vec3(*[float(x) for x in wp0])
+                pose_o.r = gymapi.Quat(*[float(x) for x in q0])
+                self.overlay_actor = self.gym.create_actor(
+                    self.env, self.overlay_asset, pose_o,
+                    "overlay_hand", 0, NO_COLL_FILTER,
+                )
+                dof_states = self.gym.get_actor_dof_states(
+                    self.env, self.overlay_actor, gymapi.STATE_ALL
+                )
+                dof_pos0 = np.asarray(self.overlay_pkl_data["opt_dof_pos"][0])
+                n_dof_urdf = self.gym.get_asset_dof_count(self.overlay_asset)
+                K = min(n_dof_urdf, dof_pos0.shape[0])
+                if n_dof_urdf != dof_pos0.shape[0]:
+                    print(f"[viz] WARN: overlay URDF has {n_dof_urdf} DoF but "
+                          f"pkl has {dof_pos0.shape[0]} — using min")
+                for i in range(K):
+                    dof_states["pos"][i] = float(dof_pos0[i])
+                    dof_states["vel"][i] = 0.0
+                self.gym.set_actor_dof_states(
+                    self.env, self.overlay_actor, dof_states, gymapi.STATE_ALL
+                )
+                self.gym.set_actor_dof_position_targets(
+                    self.env, self.overlay_actor,
+                    dof_pos0[:K].astype(np.float32),
+                )
+                self._overlay_n_dof = K
+                # Tint
+                n_links = self.gym.get_asset_rigid_body_count(self.overlay_asset)
+                for li in range(n_links):
+                    self.gym.set_rigid_body_color(
+                        self.env, self.overlay_actor, li,
+                        gymapi.MESH_VISUAL,
+                        gymapi.Vec3(*self._overlay_color),
+                    )
+            else:
+                self.overlay_actor = None
+                self._overlay_n_dof = 0
+        # Fallback fingertip-only markers when JSON has no 21-joint skeleton
+        if not self.has_skeleton:
             K = self.traj.num_fingertips
             for k in range(K):
                 pose_f = gymapi.Transform(
@@ -340,7 +543,6 @@ class TrajectoryViewer:
                     gymapi.Vec3(*colour),
                 )
                 self.ftip_actors.append(actor)
-            self.joint_actors: List[int] = []
 
     # ------------------------------------------------------------------
 
@@ -394,11 +596,56 @@ class TrajectoryViewer:
         wp = self.traj.wrist_goals[t, :3].cpu().numpy()
         self._set_actor_pose(self.wrist_actor, wp)
 
-        if self.has_skeleton:
+        if self.has_skeleton and self._show_mano and self.joint_actors:
             joints_t = self.traj.joints_world[t].cpu().numpy()         # (21, 3)
             for j, actor in enumerate(self.joint_actors):
                 self._set_actor_pose(actor, joints_t[j])
             self._draw_bones(joints_t)
+        if self.has_skeleton:
+            # Sharpa floating-base hand
+            if self.sharpa_actor is not None:
+                from scipy.spatial.transform import Rotation as _R
+                wp = self.traj.dex_wrist_pos[t].cpu().numpy()
+                aa = self.traj.dex_wrist_rot[t].cpu().numpy()
+                quat = _R.from_rotvec(aa).as_quat()        # xyzw
+                # Set root via STATE_ALL teleport (zeros velocity too)
+                self._set_actor_pose(self.sharpa_actor, wp, quat)
+                # Set DOF positions
+                dof_states = self.gym.get_actor_dof_states(
+                    self.env, self.sharpa_actor, gymapi.STATE_ALL
+                )
+                dpos = self.traj.dex_dof_pos[t].cpu().numpy()
+                K = self._sharpa_n_dof
+                for i in range(K):
+                    dof_states["pos"][i] = float(dpos[i])
+                    dof_states["vel"][i] = 0.0
+                self.gym.set_actor_dof_states(
+                    self.env, self.sharpa_actor, dof_states, gymapi.STATE_ALL
+                )
+                self.gym.set_actor_dof_position_targets(
+                    self.env, self.sharpa_actor, dpos[:K].astype(np.float32)
+                )
+            # Overlay floating-base hand
+            if self.overlay_actor is not None:
+                from scipy.spatial.transform import Rotation as _R
+                wp = np.asarray(self.overlay_pkl_data["opt_wrist_pos"][t])
+                aa = np.asarray(self.overlay_pkl_data["opt_wrist_rot"][t])
+                quat = _R.from_rotvec(aa).as_quat()
+                self._set_actor_pose(self.overlay_actor, wp, quat)
+                dof_states = self.gym.get_actor_dof_states(
+                    self.env, self.overlay_actor, gymapi.STATE_ALL
+                )
+                dpos = np.asarray(self.overlay_pkl_data["opt_dof_pos"][t])
+                K = self._overlay_n_dof
+                for i in range(K):
+                    dof_states["pos"][i] = float(dpos[i])
+                    dof_states["vel"][i] = 0.0
+                self.gym.set_actor_dof_states(
+                    self.env, self.overlay_actor, dof_states, gymapi.STATE_ALL
+                )
+                self.gym.set_actor_dof_position_targets(
+                    self.env, self.overlay_actor, dpos[:K].astype(np.float32),
+                )
         else:
             for k, actor in enumerate(self.ftip_actors):
                 fp = self.traj.fingertip_goals[t, k].cpu().numpy()
@@ -485,10 +732,14 @@ class TrajectoryViewer:
                         self.playing = False
                 self._apply_frame(self.frame_idx)
 
-            # Pure-kinematic render: we do NOT call gym.simulate() so PhysX
-            # never has a chance to integrate forces between teleport calls.
-            # Direct state writes via set_actor_rigid_body_states are still
-            # picked up by the renderer below.
+            # If the Sharpa floating-base hand is loaded we MUST call simulate()
+            # once per frame, otherwise the renderer never sees the per-link
+            # transforms induced by our DOF state writes (only the root moves).
+            # Each actor uses collision filter=-1 so no contacts are resolved
+            # between actors, and gravity is disabled — so a single sim step
+            # with zero DOF velocities is effectively a kinematic FK refresh.
+            if self.sharpa_actor is not None or self.overlay_actor is not None:
+                self.gym.simulate(self.sim)
             self.gym.fetch_results(self.sim, True)
             if self.viewer is not None:
                 self.gym.step_graphics(self.sim)
@@ -520,6 +771,20 @@ def main() -> int:
                    help="Replay frame rate; trajectories are typically 3 Hz")
     p.add_argument("--no-loop", action="store_true",
                    help="Stop at the last frame instead of looping")
+    p.add_argument("--overlay-pkl", default=None,
+                   help="Optional second retarget pkl (e.g., Inspire) to spawn "
+                        "an overlay floating-base hand alongside Sharpa.  Must "
+                        "have opt_wrist_pos / opt_wrist_rot / opt_dof_pos.")
+    p.add_argument("--overlay-urdf", default=None,
+                   help="URDF for the overlay hand (e.g., inspire_hand_right.urdf).")
+    p.add_argument("--no-mano", action="store_true",
+                   help="Hide the 21 MANO ground-truth joint markers + bones, "
+                        "leaving only the dexhand(s) + object visible.")
+    p.add_argument("--no-sharpa", action="store_true",
+                   help="Hide the Sharpa floating-base hand even if the JSON "
+                        "trajectory has dex.* fields.")
+    p.add_argument("--overlay-color", default="0.30,0.85,0.45",
+                   help="RGB tint for the overlay hand mesh, as 'r,g,b' floats in [0,1].")
     p.add_argument("--max-steps", type=int, default=0,
                    help="Auto-quit after N sim steps (0 = run forever)")
     args = p.parse_args()
@@ -539,7 +804,10 @@ def main() -> int:
         # missing meshes / runtime errors do not silently pass.
         print("\n[auto] running headless IsaacGym scene checks…")
         viewer = TrajectoryViewer(
-            traj=traj, headless=True, hz=args.hz, loop=False
+            traj=traj, headless=True, hz=args.hz, loop=False,
+            overlay_pkl=args.overlay_pkl, overlay_urdf=args.overlay_urdf,
+            overlay_color=args.overlay_color,
+            show_mano=not args.no_mano, show_sharpa=not args.no_sharpa,
         )
         try:
             scene_ok = True
@@ -561,7 +829,10 @@ def main() -> int:
         return 0 if (auto_ok and scene_ok) else 1
 
     viewer = TrajectoryViewer(
-        traj=traj, headless=False, hz=args.hz, loop=not args.no_loop
+        traj=traj, headless=False, hz=args.hz, loop=not args.no_loop,
+        overlay_pkl=args.overlay_pkl, overlay_urdf=args.overlay_urdf,
+        overlay_color=args.overlay_color,
+        show_mano=not args.no_mano, show_sharpa=not args.no_sharpa,
     )
     print("[viz] keys: Space=play/pause  N=next  P=prev  R=reset  Q=quit")
     try:

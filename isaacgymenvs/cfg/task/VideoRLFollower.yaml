@@ -27,33 +27,64 @@ env:
   objectAngularDamping: 0.0
   objectLinearDamping: 0.0
 
-  # Reward weights for the hand-pose follow-up (added on top of object reward)
+  # ── Legacy hand-pose follow-up reward ────────────────────────────────────
+  # KEPT only for the populate_obs_and_states_buffers cache + observation
+  # exposure (so policy still sees wrist + fingertip goals).  These weights
+  # NO LONGER feed the reward (compute_kuka_reward dropped them in favour of
+  # imitRewardScale below).  Kept here so older yaml configs don't break.
   handPoseRewardScale:
-    wristPos: 1.0
-    wristRot: 0.5
-    fingertip: 2.0
-    lambdaWristPos: 30.0      # decay rate (m^-1)
-    lambdaWristRot: 5.0       # decay rate (rad^-1)
-    lambdaFingertip: 50.0     # decay rate (m^-1)
+    wristPos: 0.0       # superseded by imitRewardScale.eefPos
+    wristRot: 0.0       # superseded by imitRewardScale.eefRot
+    fingertip: 0.0      # superseded by imitRewardScale.{index,middle,...}Tip
+    lambdaWristPos: 30.0
+    lambdaWristRot: 5.0
+    lambdaFingertip: 50.0
 
-  # Whether to append (wrist_goal, fingertip_goal_local) to the policy obs.
   exposeHandGoalToPolicy: True
 
-  # Full-hand-tracking reward (ManipTrans imitator style).  Only active when
-  # the trajectory JSON contains a `dex` block (run
-  # tools/merge_retarget_into_trajectory.py to add it).  Set ``enable`` to a
-  # non-zero scalar (e.g. 2.0) to turn it on; per-link weights match
-  # ManipTrans/dexhandimitator.py:1158-1166 grouping.
+  # ── ManipTrans Stage-1 imitation reward (R_imit, paper coefficients) ────
+  # See dexhandimitator.py:1115-1172.  Set enable=0 to disable R_imit entirely.
+  # MANO-keypoint-target → 27 Sharpa link distances are computed via the
+  # to_hand mapping (paper-style); per-group exp-decay is then weighted.
+  # Velocity / power terms from the paper are NOT yet implemented (the env
+  # does not expose target velocities or dof_force) and contribute 0.
+  imitRewardScale:
+    enable:           1.0
+    eefPos:           0.1
+    eefRot:           0.6
+    thumbTip:         0.9
+    indexTip:         0.8
+    middleTip:        0.75
+    ringTip:          0.6
+    pinkyTip:         0.6
+    level1:           0.5
+    level2:           0.3
+    lambdaEefPos:     40.0
+    lambdaEefRot:      1.0
+    lambdaThumbTip:  100.0
+    lambdaIndexTip:   90.0
+    lambdaMiddleTip:  80.0
+    lambdaRingTip:    60.0
+    lambdaPinkyTip:   60.0
+    lambdaLevel1:     50.0
+    lambdaLevel2:     40.0
+
+  # ── ManipTrans-style reset (Stage-2) ─────────────────────────────────────
+  # If True, on each episode reset overwrite the hand DOFs (slots 7..7+22)
+  # with opt_dof_pos[seq_idx] from the retarget pkl, so RL starts from a
+  # ManipTrans-warm-started pre-grasp pose rather than the SimToolReal default.
+  # The arm DOFs (slots 0..7) are still SimToolReal-randomized — we don't IK
+  # to opt_wrist_pos because the floating-base ManipTrans setup doesn't
+  # constrain the arm.
+  useRetargetDofInit: True
+
+  # If True, sample a random sub-goal frame as the episode start (and align
+  # sub_goal_idx to it).  False → always start at frame 0.
+  randomStateInit: True
+
+  # Deprecated: kept only so older yaml configs don't choke on missing key.
   fullHandTrackingScale:
-    enable:    0.0      # 0 → off; 1.0–2.0 typical when on
-    thumbTip:  0.9
-    indexTip:  0.8
-    middleTip: 0.75
-    ringTip:   0.6
-    pinkyTip:  0.6
-    level1:    0.5      # MCP_VL of each finger
-    level2:    0.3      # PIP/DIP/intermediate links
-    lambda:    50.0     # decay rate (m^-1)
+    enable: 0.0
 
   # ----- SimToolReal-inherited settings (kept) -----
   # if given, will override the device setting in gym.
@@ -115,18 +146,25 @@ env:
   angVelImpulseScale: 0.0
   angVelImpulseOnlyWhenLifted: True
 
-  liftingRewScale: 20.0
-  liftingBonus: 300.0
-  liftingBonusThreshold: 0.15  # when the object is lifted this distance (in meters) above the table, the agent gets the lifting bonus
-  keypointRewScale: 200.0
-  distanceDeltaRewScale: 50.0
-  reachGoalBonus: 1000.0
+  # ── DENSE pickup-shaping rewards: ZEROED for ManipTrans×SimToolReal hybrid.
+  # The user explicitly asked to drop "拿起的reward" (pickup dense shaping)
+  # and keep only the SimToolReal SPARSE goal bonus (reachGoalBonus below).
+  # If you want to revert to the SimToolReal pure-pickup setup, restore the
+  # original 20/300/200/50 values (and set imitRewardScale.enable=0).
+  liftingRewScale: 0.0           # was 20.0  — dense object-lift shaping
+  liftingBonus: 0.0              # was 300.0 — sparse "object above threshold" bonus
+  liftingBonusThreshold: 0.15
+  keypointRewScale: 0.0          # was 200.0 — dense object→goal-keypoint shaping
+  distanceDeltaRewScale: 0.0     # was 50.0  — dense fingertip→object shaping
+  # ── SPARSE goal-reaching bonus: KEPT (this is the SimToolReal sparse signal).
+  reachGoalBonus: 1000.0         # bonus when keypoints_max_dist ≤ tolerance for N steps
+  # ── Action / object-velocity penalties: KEPT, defaults preserved.
   kukaActionsPenaltyScale: 0.03
   handActionsPenaltyScale: 0.003
   fallDistance: 0.24
   fallPenalty: 0.0
-  objectLinVelPenaltyScale: 0.0  # Typically want angvel scale to be 100x smaller than linvel scale
-  objectAngVelPenaltyScale: 0.0  # Because 0.05-0.2m/s ~~ 0.5-2.0rad/s, 10x factor, which is squared
+  objectLinVelPenaltyScale: 0.0
+  objectAngVelPenaltyScale: 0.0
 
   privilegedActions: False
   privilegedActionsTorque: 0.02

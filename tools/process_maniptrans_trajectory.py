@@ -375,6 +375,86 @@ def _build_full_trajectory(
     )
 
 
+# ---------------------------------------------------------------------------
+# Coordinate-frame transform: MANO native frame → IsaacGym world frame
+# ---------------------------------------------------------------------------
+
+
+def _quat_xyzw_left_multiply(rotmat: np.ndarray, quat_xyzw: np.ndarray) -> np.ndarray:
+    """Apply left-multiplied rotation R to a quaternion array (..., 4) xyzw."""
+    R_q = np.zeros(quat_xyzw.shape[:-1] + (3, 3))
+    R_q[..., :, :] = _rotmat_from_quat_xyzw(quat_xyzw)
+    new_R = rotmat @ R_q
+    return _rotmat_to_quat_xyzw(new_R)
+
+
+def _rotmat_from_quat_xyzw(q: np.ndarray) -> np.ndarray:
+    x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    R = np.empty(q.shape[:-1] + (3, 3))
+    R[..., 0, 0] = 1 - 2 * (y * y + z * z)
+    R[..., 0, 1] = 2 * (x * y - z * w)
+    R[..., 0, 2] = 2 * (x * z + y * w)
+    R[..., 1, 0] = 2 * (x * y + z * w)
+    R[..., 1, 1] = 1 - 2 * (x * x + z * z)
+    R[..., 1, 2] = 2 * (y * z - x * w)
+    R[..., 2, 0] = 2 * (x * z - y * w)
+    R[..., 2, 1] = 2 * (y * z + x * w)
+    R[..., 2, 2] = 1 - 2 * (x * x + y * y)
+    return R
+
+
+def _apply_table_transform(traj: dict, table_z: float = 0.415,
+                           grab_loader_offset: bool = True) -> dict:
+    """Lift the entire trajectory into IsaacGym world frame (Z up + +z table top).
+
+    Mirrors ManipTrans's mano2dexhand mujoco2gym_transf:
+        R_mj  = R_z(-pi/2) @ R_x(pi/2)        # MANO Y-up → Gym Z-up
+        t_mj  = (0, 0, table_z)               # land MANO origin on table top
+
+    When ``grab_loader_offset`` is True (default), also pre-multiply by the
+    GRAB loader's transf_offset (so the result matches what the retargeter
+    actually optimised against):
+        R_off = R_x(-pi/2) @ R_z(+pi/2)       # GRAB raw is Z-up already, so
+                                              # this composes with R_mj to
+                                              # near-identity.
+        t_off = (0, 0.018, 0)
+    The composed transform is R = R_mj @ R_off plus translations.
+    Set ``grab_loader_offset=False`` if you have a true MANO-Y-up source that
+    does NOT pass through the GRAB loader (e.g. a custom loader that keeps the
+    raw frame).
+    """
+    R_mj = _aa_to_rotmat(np.array([0, 0, -np.pi / 2])) @ _aa_to_rotmat(np.array([np.pi / 2, 0, 0]))
+    t_mj = np.array([0.0, 0.0, float(table_z)])
+    if grab_loader_offset:
+        R_off = _aa_to_rotmat(np.array([-np.pi / 2, 0, 0])) @ _aa_to_rotmat(np.array([0, 0, np.pi / 2]))
+        t_off = np.array([0.0, 0.018, 0.0])
+        R = R_mj @ R_off
+        t = R_mj @ t_off + t_mj
+    else:
+        R = R_mj
+        t = t_mj
+
+    out = dict(traj)  # shallow copy
+    # Object pose: rotation × old_R, position rotated + translated
+    obj_pose = traj["object_pose"]                                  # (T, 7)
+    obj_R_old = _rotmat_from_quat_xyzw(obj_pose[:, 3:7])
+    obj_R_new = R @ obj_R_old
+    obj_quat_new = _rotmat_to_quat_xyzw(obj_R_new)
+    obj_pos_new = (R @ obj_pose[:, :3].T).T + t
+    out["object_pose"] = np.concatenate([obj_pos_new, obj_quat_new], axis=-1)
+    # Wrist pose
+    out["wrist_pos"] = (R @ traj["wrist_pos"].T).T + t
+    wrist_R_old = _rotmat_from_quat_xyzw(traj["wrist_quat"])
+    out["wrist_quat"] = _rotmat_to_quat_xyzw(R @ wrist_R_old)
+    # Fingertip world positions (T, K, 3)
+    out["fingertips_w"] = (R @ traj["fingertips_w"].reshape(-1, 3).T).T.reshape(traj["fingertips_w"].shape) + t
+    # Joints world positions (T, 21, 3) if present
+    if traj.get("joints_w") is not None:
+        out["joints_w"] = (R @ traj["joints_w"].reshape(-1, 3).T).T.reshape(traj["joints_w"].shape) + t
+    # Local quantities are invariant to world rotation/translation.
+    return out
+
+
 def _downsample(traj: dict, src_fps: float, target_fps: float) -> dict:
     """Sub-sample the dense trajectory to ``target_fps``."""
     if target_fps >= src_fps:
@@ -564,6 +644,26 @@ def main() -> int:
         "--no-skeleton", action="store_true",
         help="Skip 21-joint extraction even if MANO_RIGHT.pkl is available.",
     )
+    p.add_argument(
+        "--apply-table-transform", action="store_true",
+        help="Apply ManipTrans's mujoco2gym_transf so the output is in "
+             "IsaacGym world frame: rotated MANO Y-up → Z-up plus +z table "
+             "offset.  Object will sit on top of a virtual table at the "
+             "configured z (default 0.415 m, matching ManipTrans).",
+    )
+    p.add_argument(
+        "--table-z", type=float, default=0.415,
+        help="Table surface height in metres (only used when "
+             "--apply-table-transform).  Default 0.415 m matches "
+             "ManipTrans's table_pos.z (0.4) + table half-thickness (0.015).",
+    )
+    p.add_argument(
+        "--no-grab-loader-offset", action="store_true",
+        help="Disable the GRAB loader's transf_offset compose (default ON).  "
+             "Use this when the source data is being read by a true OakInk-V2 "
+             "loader rather than hot-swapped through GRAB's grab_demo/102 "
+             "slot.  Has no effect unless --apply-table-transform is set.",
+    )
     args = p.parse_args()
 
     out_path = Path(args.project_root) / args.out
@@ -620,6 +720,15 @@ def main() -> int:
         bbox = (0.10, 0.05, 0.05)
         src = f"ManipTrans/grab_demo/{args.data_idx}"
 
+    if args.apply_table_transform:
+        full = _apply_table_transform(
+            full, table_z=args.table_z,
+            grab_loader_offset=not args.no_grab_loader_offset,
+        )
+        print(f"[transform] applied mujoco2gym (table_z={args.table_z} m).  "
+              f"Frame 0 object xyz: {full['object_pose'][0, :3]}")
+        # If the data needs the env's grasp_bbox tuned for table-pose object,
+        # the user can also adjust it via the JSON afterwards.
     sub = _downsample(full, args.src_fps, args.target_fps)
     j = _to_json(
         sub,
