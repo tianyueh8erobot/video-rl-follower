@@ -436,32 +436,59 @@ class VideoRLFollower(SimToolReal):
     # ------------------------------------------------------------------
 
     def _load_main_object_asset(self):
-        """Override SimToolReal's loader so the user can flip
-        ``objectDisableGravity`` / damping per-task without touching code.
+        """Override SimToolReal's loader to mirror ManipTrans's
+        ``_create_obj_assets`` (dexhandmanip_sh.py:572-616).  The MaipTrans
+        recipe is essential for stability under untrained-policy contacts:
 
-        Defaults match ManipTrans's _create_obj_assets
-        (dexhandmanip_sh.py:572): ``fix_base_link=False``, gravity ENABLED,
-        no extra damping.  The paper's "G=0 → restore" relaxation is
-        sim-level (gym.set_sim_params) and is NOT applied here.
+          - ``override_com=True, override_inertia=True``: PhysX recomputes
+            the inertia tensor from the (VHACD'd) geometry, avoiding the
+            brittle defaults that come with un-curated URDFs.
+          - ``max_linear_velocity=50, max_angular_velocity=100``: HARD
+            velocity caps that prevent the object from being launched into
+            CUDA-illegal-memory-access territory when the hand flails.
+            **This is the main missing ingredient that causes our segfaults.**
+          - ``vhacd_resolution=200000``: high-quality convex decomposition.
+          - ``thickness=0.001``: thin contact layer.
+          - density=200 / friction=2.0 / rolling=0.05 / torsion=0.05: the
+            paper's "low-fill 3D-print" object physics.
+
+        We still expose ``objectDisableGravity`` / damping via cfg as
+        debugging knobs but DEFAULT them to the ManipTrans values
+        (gravity ON, no extra damping).
         """
         from isaacgym import gymapi
         import os as _os
 
-        disable_g  = bool(self.cfg["env"].get("objectDisableGravity", False))
-        ang_damp   = float(self.cfg["env"].get("objectAngularDamping", 0.0))
-        lin_damp   = float(self.cfg["env"].get("objectLinearDamping", 0.0))
+        # Cfg overrides — ManipTrans defaults (gravity ON, no damping).
+        disable_g = bool(self.cfg["env"].get("objectDisableGravity", False))
+        ang_damp  = float(self.cfg["env"].get("objectAngularDamping", 0.0))
+        lin_damp  = float(self.cfg["env"].get("objectLinearDamping", 0.0))
 
         object_assets = []
         for object_asset_file, need_vhacd in zip(
             self.object_asset_files, self.object_need_vhacds
         ):
             opts = gymapi.AssetOptions()
-            opts.vhacd_enabled = need_vhacd
-            opts.collapse_fixed_joints = True
+            # ── ManipTrans paper recipe ──────────────────────────────────
+            opts.override_com               = True
+            opts.override_inertia           = True
+            opts.convex_decomposition_from_submeshes = True
+            opts.mesh_normal_mode           = gymapi.COMPUTE_PER_VERTEX
+            opts.thickness                  = 0.001
+            opts.max_linear_velocity        = 50.0   # ★ anti-explosion cap
+            opts.max_angular_velocity       = 100.0  # ★ anti-explosion cap
+            opts.fix_base_link              = False
+            opts.vhacd_enabled              = True
+            opts.vhacd_params               = gymapi.VhacdParams()
+            opts.vhacd_params.resolution    = 200000
+            opts.density                    = 200.0  # 3D-printed equivalent
+            # ── Debugging knobs (cfg-overridable) ────────────────────────
+            opts.disable_gravity            = disable_g
+            opts.angular_damping            = ang_damp
+            opts.linear_damping             = lin_damp
+            # ── kept for compatibility with SimToolReal pipeline ─────────
+            opts.collapse_fixed_joints      = True
             opts.replace_cylinder_with_capsule = True
-            opts.disable_gravity = disable_g
-            opts.angular_damping = ang_damp
-            opts.linear_damping = lin_damp
 
             asset = self.gym.load_asset(
                 self.sim,
@@ -469,13 +496,21 @@ class VideoRLFollower(SimToolReal):
                 _os.path.basename(object_asset_file),
                 opts,
             )
+            # ★ Match paper friction (compensates missing skin friction).
+            shape_props = self.gym.get_asset_rigid_shape_properties(asset)
+            for el in shape_props:
+                el.friction = 2.0
+                el.rolling_friction = 0.05
+                el.torsion_friction = 0.05
+            self.gym.set_asset_rigid_shape_properties(asset, shape_props)
             object_assets.append(asset)
 
         rb_count = self.gym.get_asset_rigid_body_count(object_assets[0])
         sh_count = self.gym.get_asset_rigid_shape_count(object_assets[0])
-        print(f"[VideoRLFollower] object asset loaded with "
+        print(f"[VideoRLFollower] object asset (ManipTrans recipe): "
               f"disable_gravity={disable_g}, lin_damp={lin_damp}, "
-              f"ang_damp={ang_damp}")
+              f"ang_damp={ang_damp}, max_lin_vel=50, max_ang_vel=100, "
+              f"density=200, friction=2.0, vhacd_res=200000")
         return object_assets, rb_count, sh_count
 
     # ------------------------------------------------------------------
