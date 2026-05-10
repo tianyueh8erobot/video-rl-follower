@@ -697,7 +697,7 @@ class VideoRLFollower(SimToolReal):
             return torch.zeros(self.num_envs, device=self.device)
 
         # ── Current Sharpa body link world positions (N, 28, 3) ──
-        rb_t = self._rigid_body_state_tensor.view(self.num_envs, -1, 13)
+        rb_t = self.rigid_body_states                 # (N, num_bodies, 13)
         actual_28 = rb_t[:, self._imit_link_handles_t, :3]       # (N, 28, 3)
         actual_27 = actual_28[:, 1:, :]                           # skip wrist (handled by R_eef)
 
@@ -779,7 +779,7 @@ class VideoRLFollower(SimToolReal):
 
         # Mean fingertip-to-MANO-tip distance (Sharpa thumb/index/.../pinky)
         if self._imit_active:
-            rb_t = self._rigid_body_state_tensor.view(self.num_envs, -1, 13)
+            rb_t = self.rigid_body_states                 # (N, num_bodies, 13)
             actual_28 = rb_t[:, self._imit_link_handles_t, :3]             # (N, 28, 3)
             tip_idx_in_27 = torch.tensor(
                 # subtract 1 because we skip wrist=body[0]
