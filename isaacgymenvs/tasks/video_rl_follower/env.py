@@ -706,21 +706,13 @@ class VideoRLFollower(SimToolReal):
             self.arm_hand_dof_vel[env_ids, n_arm:n_arm + n_hand_env] = 0.0
             self.prev_targets[env_ids, n_arm:n_arm + n_hand_env] = hand_dof
             self.cur_targets[env_ids, n_arm:n_arm + n_hand_env] = hand_dof
-
-            # ★ Critical fix: super().reset_idx already pushed prev_targets to
-            # PhysX via set_dof_position_target_tensor_indexed BEFORE our
-            # override.  Without this re-push, PhysX still sees the random-
-            # init targets and PD-controls toward them while our warm-start
-            # DOF state is large-distance away → enormous torques → PhysX
-            # CUDA "illegal memory access" segfault within ~10 epochs.
-            from isaacgym import gymtorch as _gymtorch
-            robot_indices = self.robot_indices[env_ids].to(torch.int32)
-            self.gym.set_dof_position_target_tensor_indexed(
-                self.sim,
-                _gymtorch.unwrap_tensor(self.prev_targets),
-                _gymtorch.unwrap_tensor(robot_indices),
-                len(env_ids),
-            )
+            # NOTE: do NOT re-push set_dof_position_target_tensor_indexed
+            # here.  Earlier we did (worried about super's already-pushed
+            # random targets fighting our warm-start state), but the policy's
+            # action loop overwrites position targets every sim step anyway,
+            # and the duplicate call may race with super's deferred
+            # set_dof_state_tensor_indexed leading to PhysX state corruption
+            # during mass episode-reset (step ~episodeLength).
         # Don't leak the cache into next call.
         self._cached_reset_seq_idx = None
 
