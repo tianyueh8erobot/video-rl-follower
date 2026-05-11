@@ -142,6 +142,17 @@ class ReferenceTrajectory:
         # config matches the retarget.
         wrist_pos_ik: Optional[torch.Tensor] = None,
         wrist_quat_ik: Optional[torch.Tensor] = None,
+        # ★ Velocity fields (paper-faithful, computed by prep_60hz_with_velocities.py
+        # using np.gradient + gaussian σ=2 at dt=1/60s — matches
+        # ManipTrans/main/dataset/base.py:57-83).  Optional — None if 3Hz
+        # legacy traj or if velocities haven't been precomputed.
+        kuka_dof_velocity: Optional[torch.Tensor] = None,
+        dex_dof_velocity: Optional[torch.Tensor] = None,
+        dex_wrist_velocity: Optional[torch.Tensor] = None,
+        dex_wrist_angular_velocity: Optional[torch.Tensor] = None,
+        obj_velocity: Optional[torch.Tensor] = None,
+        obj_angular_velocity: Optional[torch.Tensor] = None,
+        joints_velocity: Optional[torch.Tensor] = None,
     ) -> None:
         self.meta = meta
         self.object_urdf_path = object_urdf_path
@@ -239,6 +250,15 @@ class ReferenceTrajectory:
         self.wrist_pos_ik = wrist_pos_ik.float() if wrist_pos_ik is not None else None
         self.wrist_quat_ik = wrist_quat_ik.float() if wrist_quat_ik is not None else None
         self.has_retargeted = self.dex_links_world is not None
+        # ★ TRACKING BRANCH velocity storage (Tier 0)
+        self.kuka_dof_velocity = kuka_dof_velocity.float() if kuka_dof_velocity is not None else None
+        self.dex_dof_velocity = dex_dof_velocity.float() if dex_dof_velocity is not None else None
+        self.dex_wrist_velocity = dex_wrist_velocity.float() if dex_wrist_velocity is not None else None
+        self.dex_wrist_angular_velocity = dex_wrist_angular_velocity.float() if dex_wrist_angular_velocity is not None else None
+        self.obj_velocity = obj_velocity.float() if obj_velocity is not None else None
+        self.obj_angular_velocity = obj_angular_velocity.float() if obj_angular_velocity is not None else None
+        self.joints_velocity = joints_velocity.float() if joints_velocity is not None else None
+        self.has_velocities = self.obj_velocity is not None
 
         # Frames where IK can land the wrist within `reachable_ik_threshold_m`
         # of the trajectory's target.  Frames outside this set spawn the dex
@@ -347,6 +367,19 @@ class ReferenceTrajectory:
                 _wrist_quat_ik = torch.as_tensor(dex["wrist_quat_ik"], dtype=torch.float32)
             else:
                 _wrist_quat_ik = None
+            # ★ TRACKING BRANCH: paper-style velocity fields (per
+            # ManipTrans dataset/base.py:57-83 — np.gradient + gaussian σ=2).
+            _kuka_dof_vel = torch.as_tensor(dex["kuka_dof_velocity"], dtype=torch.float32) if "kuka_dof_velocity" in dex else None
+            _dex_dof_vel  = torch.as_tensor(dex["dof_velocity"], dtype=torch.float32) if "dof_velocity" in dex else None
+            _dex_wrist_vel     = torch.as_tensor(dex["wrist_velocity"], dtype=torch.float32) if "wrist_velocity" in dex else None
+            _dex_wrist_ang_vel = torch.as_tensor(dex["wrist_angular_velocity"], dtype=torch.float32) if "wrist_angular_velocity" in dex else None
+
+        # Object velocities (paper recipe)
+        _obj_vel     = torch.as_tensor(obj["velocity"], dtype=torch.float32) if "velocity" in obj else None
+        _obj_ang_vel = torch.as_tensor(obj["angular_velocity"], dtype=torch.float32) if "angular_velocity" in obj else None
+
+        # MANO joint velocities (paper recipe, used in R_imit)
+        _joints_vel = torch.as_tensor(hand["joints_velocity"], dtype=torch.float32) if "joints_velocity" in hand else None
 
         return cls(
             meta=d.get("meta", {}),
@@ -369,6 +402,13 @@ class ReferenceTrajectory:
             kuka_dof_pos=_kuka_dof,
             wrist_pos_ik=_wrist_pos_ik,
             wrist_quat_ik=_wrist_quat_ik,
+            kuka_dof_velocity=_kuka_dof_vel,
+            dex_dof_velocity=_dex_dof_vel,
+            dex_wrist_velocity=_dex_wrist_vel,
+            dex_wrist_angular_velocity=_dex_wrist_ang_vel,
+            obj_velocity=_obj_vel,
+            obj_angular_velocity=_obj_ang_vel,
+            joints_velocity=_joints_vel,
         )
 
     # ------------------------------------------------------------------
@@ -401,6 +441,21 @@ class ReferenceTrajectory:
             self.dex_wrist_rot = self.dex_wrist_rot.to(device)
         if self.reachable_frames is not None:
             self.reachable_frames = self.reachable_frames.to(device)
+        # ★ TRACKING BRANCH velocity fields
+        if self.kuka_dof_velocity is not None:
+            self.kuka_dof_velocity = self.kuka_dof_velocity.to(device)
+        if self.dex_dof_velocity is not None:
+            self.dex_dof_velocity = self.dex_dof_velocity.to(device)
+        if self.dex_wrist_velocity is not None:
+            self.dex_wrist_velocity = self.dex_wrist_velocity.to(device)
+        if self.dex_wrist_angular_velocity is not None:
+            self.dex_wrist_angular_velocity = self.dex_wrist_angular_velocity.to(device)
+        if self.obj_velocity is not None:
+            self.obj_velocity = self.obj_velocity.to(device)
+        if self.obj_angular_velocity is not None:
+            self.obj_angular_velocity = self.obj_angular_velocity.to(device)
+        if self.joints_velocity is not None:
+            self.joints_velocity = self.joints_velocity.to(device)
         if self.dex_links_world is not None:
             self.dex_links_world = self.dex_links_world.to(device)
         return self

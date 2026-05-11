@@ -85,6 +85,35 @@ def _quat_geodesic_angle_xyzw(a: Tensor, b: Tensor) -> Tensor:
     return 2.0 * torch.acos(dot)
 
 
+def _quat_conjugate_xyzw(q: Tensor) -> Tensor:
+    """Conjugate of quaternion (xyzw)."""
+    return torch.cat([-q[..., :3], q[..., 3:]], dim=-1)
+
+
+def _quat_mul_xyzw(a: Tensor, b: Tensor) -> Tensor:
+    """Quaternion multiplication a*b for xyzw layout."""
+    ax, ay, az, aw = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+    bx, by, bz, bw = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+    return torch.stack([
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ], dim=-1)
+
+
+def _rotvec_to_quat_xyzw(rotvec: Tensor) -> Tensor:
+    """Convert rotation vector (T, 3) to quaternion (T, 4) xyzw."""
+    angle = rotvec.norm(dim=-1, keepdim=True)                      # (T, 1)
+    half = angle * 0.5
+    sin_half = torch.sin(half)
+    cos_half = torch.cos(half)
+    # Avoid division by zero when angle=0; axis becomes [0,0,1] then sin=0 so xyz=0.
+    safe_norm = torch.where(angle < 1e-9, torch.ones_like(angle), angle)
+    axis = rotvec / safe_norm                                       # (T, 3)
+    return torch.cat([axis * sin_half, cos_half], dim=-1)           # (T, 4) xyzw
+
+
 # ---------------------------------------------------------------------------
 # Sharpa right-hand body / weight definitions, replicated from
 # maniptrans_envs/lib/envs/dexhands/sharpa.py to avoid a runtime ManipTrans
@@ -652,8 +681,17 @@ class VideoRLFollower(SimToolReal):
         obj_indices = self.object_indices[env_ids]
         self.root_state_tensor[obj_indices, 0:3] = obj_pos
         self.root_state_tensor[obj_indices, 3:7] = obj_quat
-        self.root_state_tensor[obj_indices, 7:10] = 0.0   # zero linvel
-        self.root_state_tensor[obj_indices, 10:13] = 0.0  # zero angvel
+        # ★ Tier 0: paper-style object velocity init (was zero before).
+        # Without this, object frozen at spawn — goal advances 1 frame per
+        # physics step but object has no momentum to follow → instant lag.
+        # Paper dexhandmanip_sh.py:1115-1121 sets obj_velocity + obj_angular_velocity.
+        if (traj.obj_velocity is not None
+                and traj.obj_angular_velocity is not None):
+            self.root_state_tensor[obj_indices, 7:10] = traj.obj_velocity[seq_idx]
+            self.root_state_tensor[obj_indices, 10:13] = traj.obj_angular_velocity[seq_idx]
+        else:
+            self.root_state_tensor[obj_indices, 7:10] = 0.0   # zero linvel
+            self.root_state_tensor[obj_indices, 10:13] = 0.0  # zero angvel
         # Also update object_init_state cache so any downstream readers stay
         # consistent (e.g., reach-goal logic that diff-tracks against init).
         self.object_init_state[env_ids, 0:3] = obj_pos
@@ -808,7 +846,16 @@ class VideoRLFollower(SimToolReal):
             hi = self.arm_hand_dof_upper_limits[n_arm:n_arm + n_hand_env]
             hand_dof = torch.clamp(hand_dof, lo, hi)
             self.arm_hand_dof_pos[env_ids, n_arm:n_arm + n_hand_env] = hand_dof
-            self.arm_hand_dof_vel[env_ids, n_arm:n_arm + n_hand_env] = 0.0
+            # ★ Tier 0: paper-style dex DOF velocity init (was zero before).
+            # Matches dexhandmanip_sh.py:1086-1091 — clamped to joint speed limits.
+            if self._trajectory.dex_dof_velocity is not None:
+                hand_dof_vel = self._trajectory.dex_dof_velocity[seq_idx]
+                # Speed-limit clamp (paper safety): use ±200 rad/s as proxy
+                # (Sharpa joint speed limit; conservative).
+                hand_dof_vel = torch.clamp(hand_dof_vel, -200.0, 200.0)
+                self.arm_hand_dof_vel[env_ids, n_arm:n_arm + n_hand_env] = hand_dof_vel
+            else:
+                self.arm_hand_dof_vel[env_ids, n_arm:n_arm + n_hand_env] = 0.0
             self.prev_targets[env_ids, n_arm:n_arm + n_hand_env] = hand_dof
             self.cur_targets[env_ids, n_arm:n_arm + n_hand_env] = hand_dof
 
@@ -824,7 +871,13 @@ class VideoRLFollower(SimToolReal):
                 hi_arm = self.arm_hand_dof_upper_limits[:n_arm]
                 kuka_dof = torch.clamp(kuka_dof, lo_arm, hi_arm)
                 self.arm_hand_dof_pos[env_ids, :n_arm] = kuka_dof
-                self.arm_hand_dof_vel[env_ids, :n_arm] = 0.0
+                # ★ Tier 0: paper-style kuka DOF velocity init.
+                if self._trajectory.kuka_dof_velocity is not None:
+                    kuka_dof_vel = self._trajectory.kuka_dof_velocity[seq_idx]
+                    kuka_dof_vel = torch.clamp(kuka_dof_vel, -100.0, 100.0)
+                    self.arm_hand_dof_vel[env_ids, :n_arm] = kuka_dof_vel
+                else:
+                    self.arm_hand_dof_vel[env_ids, :n_arm] = 0.0
                 self.prev_targets[env_ids, :n_arm] = kuka_dof
                 self.cur_targets[env_ids, :n_arm] = kuka_dof
             # NOTE: do NOT re-push set_dof_position_target_tensor_indexed
@@ -930,22 +983,74 @@ class VideoRLFollower(SimToolReal):
         r_eef_rot = torch.exp(-self.lambda_imit_eef_rot * eef_rot_angle)
 
         # ── Object position + rotation reward (paper's DOMINANT terms) ──
-        # dexhandmanip_sh.py:1481-1494: 5.0 * exp(-80 * obj_pos_dist) +
-        # 1.0 * exp(-3 * obj_rot_angle).  These drive the trajectory tracking
-        # signal — without them R_imit only optimizes hand pose, not object.
+        # ★ Codex review fix: target shifted by per-frame ik_delta to match
+        # reset's IK-shifted object placement.  Without this, spawn-state
+        # has d_obj_pos = ik_delta_norm (~1-6cm) → policy starts off-reward.
         cur_obj_pos = self.object_state[:, :3]
         target_obj_pos = self._trajectory.object_goals[idx][:, :3]
+        if (self._trajectory.wrist_pos_ik is not None
+                and self._trajectory.dex_wrist_pos is not None):
+            ik_delta = (self._trajectory.wrist_pos_ik[idx]
+                        - self._trajectory.dex_wrist_pos[idx])
+            target_obj_pos = target_obj_pos + ik_delta
         diff_obj_pos_dist = (cur_obj_pos - target_obj_pos).norm(dim=-1)
         r_obj_pos = torch.exp(-80.0 * diff_obj_pos_dist)
+        r_obj_pos_wide = torch.exp(-5.0 * diff_obj_pos_dist)
 
         cur_obj_quat = self.object_state[:, 3:7]
         target_obj_quat = self._trajectory.object_goals[idx][:, 3:7]
         diff_obj_rot_angle = _quat_geodesic_angle_xyzw(cur_obj_quat, target_obj_quat)
         r_obj_rot = torch.exp(-3.0 * diff_obj_rot_angle)
 
+        # ── ★ Tier 0: 5 paper velocity reward terms (eef_vel, eef_ang_vel,
+        # joints_vel, obj_vel, obj_ang_vel) per dexhandmanip_sh.py:1472-1504.
+        # All use exp(-1 * |target - actual|.abs().mean) with paper coefficients.
+        traj = self._trajectory
+        if traj.obj_velocity is not None:
+            cur_obj_vel = self.object_state[:, 7:10]
+            target_obj_vel = traj.obj_velocity[idx]
+            diff_obj_vel = (target_obj_vel - cur_obj_vel).abs().mean(dim=-1)
+            r_obj_vel = torch.exp(-1.0 * diff_obj_vel)
+        else:
+            r_obj_vel = torch.zeros(self.num_envs, device=self.device)
+        if traj.obj_angular_velocity is not None:
+            cur_obj_ang_vel = self.object_state[:, 10:13]
+            target_obj_ang_vel = traj.obj_angular_velocity[idx]
+            diff_obj_ang_vel = (target_obj_ang_vel - cur_obj_ang_vel).abs().mean(dim=-1)
+            r_obj_ang_vel = torch.exp(-1.0 * diff_obj_ang_vel)
+        else:
+            r_obj_ang_vel = torch.zeros(self.num_envs, device=self.device)
+        if traj.dex_wrist_velocity is not None:
+            cur_eef_vel = self._palm_state[:, 7:10]
+            target_eef_vel = traj.dex_wrist_velocity[idx]
+            diff_eef_vel = (target_eef_vel - cur_eef_vel).abs().mean(dim=-1)
+            r_eef_vel = torch.exp(-1.0 * diff_eef_vel)
+        else:
+            r_eef_vel = torch.zeros(self.num_envs, device=self.device)
+        if traj.dex_wrist_angular_velocity is not None:
+            cur_eef_ang_vel = self._palm_state[:, 10:13]
+            target_eef_ang_vel = traj.dex_wrist_angular_velocity[idx]
+            diff_eef_ang_vel = (target_eef_ang_vel - cur_eef_ang_vel).abs().mean(dim=-1)
+            r_eef_ang_vel = torch.exp(-1.0 * diff_eef_ang_vel)
+        else:
+            r_eef_ang_vel = torch.zeros(self.num_envs, device=self.device)
+        if traj.joints_velocity is not None:
+            # actual joint velocity from rigid_body_states
+            rb_t = self.rigid_body_states
+            actual_joint_vel = rb_t[:, self._imit_link_handles_t[1:], 7:10]  # skip wrist (28→27)
+            # subset to MANO joints via to_mano mapping (use same target_27)
+            target_joint_vel = traj.joints_velocity[idx][:, self._imit_target_mano_idx, :]
+            diff_joints_vel = (target_joint_vel - actual_joint_vel).abs().mean(dim=-1).mean(dim=-1)
+            r_joints_vel = torch.exp(-1.0 * diff_joints_vel)
+        else:
+            r_joints_vel = torch.zeros(self.num_envs, device=self.device)
+
+        # ★ Tier 0: pure paper reward (removed non-paper r_obj_pos_wide and
+        # r_eef_pos_wide hacks that I added earlier for arm slip; now that we
+        # have velocity init + tighter rate match, those wides are no longer
+        # needed and they break strict paper fidelity).
         r_imit = (
             self.w_imit_eef_pos      * r_eef_pos
-          + self.w_imit_eef_pos_wide * r_eef_pos_wide
           + self.w_imit_eef_rot      * r_eef_rot
           + self.w_imit_thumb_tip  * r_thumb_tip
           + self.w_imit_index_tip  * r_index_tip
@@ -956,6 +1061,12 @@ class VideoRLFollower(SimToolReal):
           + self.w_imit_level_2    * r_level_2
           + 5.0 * r_obj_pos                   # paper coefficient
           + 1.0 * r_obj_rot                   # paper coefficient
+          # ★ Tier 0: 5 velocity terms (paper-faithful weights)
+          + 0.1  * r_eef_vel                  # paper 0.1
+          + 0.05 * r_eef_ang_vel              # paper 0.05
+          + 0.1  * r_joints_vel               # paper 0.1
+          + 0.1  * r_obj_vel                  # paper 0.1
+          + 0.1  * r_obj_ang_vel              # paper 0.1
         )
 
         # Cache for episode logging + termination logic in compute_kuka_reward.
@@ -1101,28 +1212,73 @@ class VideoRLFollower(SimToolReal):
         #    period).  This forces the policy to actually stay on trajectory;
         #    without it, the env keeps running far off-trajectory and the
         #    R_imit signal saturates near zero (no useful gradient).
-        if hasattr(self, "_last_imit_dists"):
+        # ★ TRACKING BRANCH: paper-style failed_execute, knob-controlled.
+        # Set cfg.env.failedExecuteEnable=False to disable (let env run full
+        # episodeLength regardless of how far off-trajectory).  When enabled,
+        # the per-component thresholds below are applied AFTER a configurable
+        # grace period (default 8 steps, paper-equivalent).  Defaults are
+        # already loosened ~2x vs paper for our IK error budget.
+        if (hasattr(self, "_last_imit_dists")
+                and bool(self.cfg["env"].get("failedExecuteEnable", True))):
             d = self._last_imit_dists
-            grace = (self.progress_buf >= 8)
+            grace_steps = int(self.cfg["env"].get("failedExecuteGraceSteps", 8))
+            grace = (self.progress_buf >= grace_steps)
+            t_obj_pos = float(self.cfg["env"].get("failedObjPos", 0.10))
+            t_obj_rot_deg = float(self.cfg["env"].get("failedObjRotDeg", 90.0))
+            t_finger = float(self.cfg["env"].get("failedFingerPos", 0.10))
             paper_failed = (
-                (d["d_obj_pos"] > 0.10)                          # 10cm  (paper 5.83cm; we loosen for arm IK error)
-                | (d["d_thumb_tip"]  > 0.08)                     # 8cm
-                | (d["d_index_tip"]  > 0.08)
-                | (d["d_middle_tip"] > 0.08)
-                | (d["d_ring_tip"]   > 0.10)
-                | (d["d_pinky_tip"]  > 0.10)
-                | (d["d_level_1"]    > 0.10)
-                | (d["d_level_2"]    > 0.12)
-                | (d["d_obj_rot"] * 180.0 / 3.14159265 > 90.0)   # 90°
+                (d["d_obj_pos"] > t_obj_pos)
+                | (d["d_thumb_tip"]  > t_finger)
+                | (d["d_index_tip"]  > t_finger)
+                | (d["d_middle_tip"] > t_finger)
+                | (d["d_ring_tip"]   > t_finger * 1.2)
+                | (d["d_pinky_tip"]  > t_finger * 1.2)
+                | (d["d_level_1"]    > t_finger * 1.2)
+                | (d["d_level_2"]    > t_finger * 1.4)
+                | (d["d_obj_rot"] * 180.0 / 3.14159265 > t_obj_rot_deg)
             ) & grace
             self.reset_buf = self.reset_buf | paper_failed
 
-        # 5) Combine.  ★ TRACKING BRANCH: rew_buf from super is mostly action +
-        #    velocity penalties + (small) sparse goal bonus when configured;
-        #    the dominant signal is now r_imit (which itself is dominated by
-        #    the 5.0 * r_obj_pos term).  Set cfg.reachGoalBonus low (e.g. 0)
-        #    to fully delegate to dense reward, paper-style.
-        combined = rew_buf + self.w_imit * r_imit
+        # 5) ★ TRACKING BRANCH: paper-only reward path.  Codex review flagged
+        #    that calling super's compute_kuka_reward injects SimToolReal
+        #    success logic, sparse bonus, action penalties, and extra
+        #    terminations — all non-paper.  Replace combined with PURE r_imit
+        #    (matches paper's reward_execute at dexhandmanip_sh.py:1543).
+        #    Action/velocity penalties from parent already accumulated in
+        #    rew_buf; we discard them entirely on tracking branch.
+        if bool(self.cfg["env"].get("paperOnlyReward", True)):
+            combined = self.w_imit * r_imit
+        else:
+            combined = rew_buf + self.w_imit * r_imit
+        # Likewise: override reset_buf with paper-style success | failed.
+        # Paper success = progress_buf + 1 + 3 >= max_length.  We use
+        # sub_goal_idx + 4 >= T (T = trajectory length) as equivalent.
+        if bool(self.cfg["env"].get("paperOnlyReset", True)):
+            T = self._trajectory.num_goals
+            paper_succeeded = (self.sub_goal_idx + 4 >= T)
+            if hasattr(self, "_last_imit_dists"):
+                d = self._last_imit_dists
+                grace_steps = int(self.cfg["env"].get("failedExecuteGraceSteps", 8))
+                grace = (self.progress_buf >= grace_steps)
+                t_obj_pos = float(self.cfg["env"].get("failedObjPos", 0.10))
+                t_obj_rot_deg = float(self.cfg["env"].get("failedObjRotDeg", 90.0))
+                t_finger = float(self.cfg["env"].get("failedFingerPos", 0.10))
+                paper_failed = (
+                    (d["d_obj_pos"] > t_obj_pos)
+                    | (d["d_thumb_tip"] > t_finger)
+                    | (d["d_index_tip"] > t_finger)
+                    | (d["d_middle_tip"] > t_finger)
+                    | (d["d_ring_tip"] > t_finger * 1.2)
+                    | (d["d_pinky_tip"] > t_finger * 1.2)
+                    | (d["d_level_1"] > t_finger * 1.2)
+                    | (d["d_level_2"] > t_finger * 1.4)
+                    | (d["d_obj_rot"] * 180.0 / 3.14159265 > t_obj_rot_deg)
+                ) & grace
+            else:
+                paper_failed = torch.zeros_like(self.reset_buf)
+            # Also keep parent's max_episode_length terminator (sanity cap).
+            ep_done = (self.progress_buf >= self.max_episode_length - 1)
+            self.reset_buf = (paper_succeeded | paper_failed | ep_done).long()
 
         # 4b) Strict-correctness check on BOTH r_imit and the combined reward.
         # A non-finite parent reward (e.g. norm-of-NaN-velocity from a sim
@@ -1151,28 +1307,42 @@ class VideoRLFollower(SimToolReal):
             self._write_diagnostic_metrics(is_success, r_imit)
 
         # 5) ★ TRACKING BRANCH: time-driven sub_goal advancement.
-        #    Every step (NOT just on success) we advance sub_goal_idx by 1,
-        #    clamped at T-1.  This forces the policy to keep up with the
-        #    trajectory's pace — there's no "stay still until the goal moves
-        #    to me" loophole that plagued the success-driven version.
+        #    Every K physics steps (NOT just on success) we advance
+        #    sub_goal_idx by 1, clamped at T-1.  K = subGoalAdvanceInterval
+        #    matches the trajectory's recording rate vs physics rate ratio:
+        #    e.g. trajectory at 3Hz + physics at 60Hz → K=20.  Without this
+        #    rate-matching, goal would advance 1.6cm per physics step (96cm/s
+        #    object motion required — physically impossible).
         #    Mirrors paper's `self.progress_buf += 1` in post_physics_step
-        #    (dexhandmanip_sh.py:1333).
+        #    (dexhandmanip_sh.py:1333), but rate-corrected for our trajectory.
         T = self._trajectory.num_goals
-        # Only advance envs that haven't been reset this step (reset_buf=0).
-        # Envs being reset will have their sub_goal_idx set to seq_idx in
-        # the upcoming reset_idx call.
-        not_resetting = (self.reset_buf == 0).nonzero(as_tuple=False).squeeze(-1)
-        if not_resetting.numel() > 0:
-            self.sub_goal_idx[not_resetting] = torch.clamp(
-                self.sub_goal_idx[not_resetting] + 1, max=T - 1
+        adv_interval = int(self.cfg["env"].get("subGoalAdvanceInterval", 20))
+        # ★ Codex fix: per-env phase from progress_buf (which resets to 0
+        # at episode reset and advances per step), NOT global gym frame count
+        # (which would create random first-frame durations across envs).
+        if adv_interval > 0:
+            advance_mask = (
+                (self.reset_buf == 0)
+                & (self.progress_buf > 0)
+                & (self.progress_buf % adv_interval == 0)
             )
-            # Refresh per-env hand goal cache + object goal_states so
-            # populate_obs sees the fresh frame.
-            self._set_hand_goal_from_trajectory(not_resetting)
-            new_idx = self.sub_goal_idx[not_resetting]
-            self.goal_states[not_resetting, 0:7] = self.trajectory_states[
-                new_idx, 0:7
-            ]
+            advance_envs = advance_mask.nonzero(as_tuple=False).squeeze(-1)
+            if advance_envs.numel() > 0:
+                self.sub_goal_idx[advance_envs] = torch.clamp(
+                    self.sub_goal_idx[advance_envs] + 1, max=T - 1
+                )
+                # Refresh per-env hand goal cache + object goal_states (with
+                # ik_delta consistency, matching reset's compensation) so
+                # populate_obs and reward see the fresh frame.
+                self._set_hand_goal_from_trajectory(advance_envs)
+                new_idx = self.sub_goal_idx[advance_envs]
+                new_goal = self.trajectory_states[new_idx, 0:7].clone()
+                if (self._trajectory.wrist_pos_ik is not None
+                        and self._trajectory.dex_wrist_pos is not None):
+                    ik_d = (self._trajectory.wrist_pos_ik[new_idx]
+                            - self._trajectory.dex_wrist_pos[new_idx])
+                    new_goal[:, 0:3] = new_goal[:, 0:3] + ik_d
+                self.goal_states[advance_envs, 0:7] = new_goal
 
         # 5) Bookkeeping.
         for key in (
@@ -1208,15 +1378,201 @@ class VideoRLFollower(SimToolReal):
         if not self.expose_hand_goal_to_policy:
             return
 
+        # ★ Tier 0: paper-style `target` obs (K=1 lookahead) per
+        # dexhandmanip_sh.py:913-1010.  Replaces the previous trivial
+        # `_wrist_goal[7] + _fingertip_goal_local[K,3]` (30 dim) with a
+        # ~256 dim block containing future wrist+joints+obj pose/vel/delta.
+        # Falls back to legacy hand_goal if paper-target prerequisites aren't
+        # in the trajectory (velocities missing).
+        if (bool(self.cfg["env"].get("paperTargetObs", True))
+                and self._trajectory.obj_velocity is not None):
+            target_obs = self._build_paper_target_obs()
+            # Critic also sees the target — paper makes it part of obs, not
+            # privileged.  Asymmetric obs would expose more for critic but we
+            # keep SimToolReal's actor/critic obs sharing.
+            self.obs_buf = torch.cat([self.obs_buf, target_obs], dim=-1)
+            self.states_buf = torch.cat([self.states_buf, target_obs], dim=-1)
+            return
+
+        # Legacy path (3Hz trajectories without velocities)
         wrist_goal = self._wrist_goal                                 # (N, 7)
         ftip_goal = self._fingertip_goal_local.reshape(self.num_envs, -1)  # (N, K*3)
         hand_goal = torch.cat([wrist_goal, ftip_goal], dim=-1)        # (N, 7+K*3)
-
-        # Concatenate to obs_buf and states_buf.  The space sizes were already
-        # bumped in __init__, so rl_games's network heads agree with these
-        # shapes.
         self.obs_buf = torch.cat([self.obs_buf, hand_goal], dim=-1)
         self.states_buf = torch.cat([self.states_buf, hand_goal], dim=-1)
+
+    # ------------------------------------------------------------------
+    # Paper-style target obs (Tier 0)
+    # ------------------------------------------------------------------
+
+    def _build_paper_target_obs(self) -> Tensor:
+        """Construct paper's `target` obs block (K=1 lookahead) per
+        dexhandmanip_sh.py:913-1010.
+
+        Returns (N, dim) tensor where dim ≈ 256 for K=1.
+
+        Layout (concat order, all flattened to (N, ·)):
+          1. delta_wrist_pos       (N, K*3)  = target.wrist_pos - current.palm_pos
+          2. wrist_vel             (N, K*3)  = target.wrist_vel
+          3. delta_wrist_vel       (N, K*3)  = target.wrist_vel - current.palm_vel
+          4. wrist_quat            (N, K*4)  = target.wrist_quat (xyzw)
+          5. delta_wrist_quat      (N, K*4)  = current.palm_quat * target.wrist_quat^-1
+          6. wrist_ang_vel         (N, K*3)
+          7. delta_wrist_ang_vel   (N, K*3)
+          8. delta_joints_pos      (N, K*21*3) MANO joints (target - current Sharpa)
+          9. joints_vel            (N, K*21*3) target MANO joints vel
+         10. delta_joints_vel      (N, K*21*3) target - current
+         11. delta_obj_pos         (N, K*3)
+         12. obj_vel               (N, K*3)
+         13. delta_obj_vel         (N, K*3)
+         14. obj_quat              (N, K*4)
+         15. delta_obj_quat        (N, K*4)
+         16. obj_ang_vel           (N, K*3)
+         17. delta_obj_ang_vel     (N, K*3)
+         18. obj_to_joints         (N, 21) current obj to each MANO joint
+
+        Total for K=1: 3*7 + 3*3 + 21*9 + 4*2 + 4*2 + 21 = 246 dims.
+        """
+        N = self.num_envs
+        K = int(self.cfg["env"].get("obsFutureLength", 1))
+        T = self._trajectory.num_goals
+
+        traj = self._trajectory
+        # Future indices: sub_goal_idx + 1, +2, ..., +K, clamped to T-1.
+        cur_idx = (self.sub_goal_idx + 1).clamp(max=T - 1)            # (N,)
+        idxs = torch.stack(
+            [torch.clamp(cur_idx + t, max=T - 1) for t in range(K)],
+            dim=-1,
+        )                                                              # (N, K)
+
+        # Helper: gather along T axis for tensor (T, ...) → (N, K, ...)
+        def gather_kt(data, idxs_NK):
+            # data: (T, ...); idxs_NK: (N, K)
+            return data[idxs_NK]                                       # (N, K, ...)
+
+        # --- Current proprioceptive state ---
+        cur_palm_pos = self.palm_center_pos                            # (N, 3)
+        cur_palm_quat = self._palm_state[:, 3:7]                       # (N, 4) xyzw
+        cur_palm_vel = self._palm_state[:, 7:10]                       # (N, 3)
+        cur_palm_ang_vel = self._palm_state[:, 10:13]                  # (N, 3)
+        cur_obj_pos = self.object_state[:, :3]                         # (N, 3)
+        cur_obj_quat = self.object_state[:, 3:7]                       # (N, 4) xyzw
+        cur_obj_vel = self.object_state[:, 7:10]                       # (N, 3)
+        cur_obj_ang_vel = self.object_state[:, 10:13]                  # (N, 3)
+
+        # --- Wrist (palm proxy) target block ---
+        # Target wrist pose comes from trajectory.dex_wrist_pos/rot at idxs.
+        # Note: traj.dex_wrist_pos is (T, 3), traj.dex_wrist_rot is (T, 3) rotvec.
+        tw_pos = gather_kt(traj.dex_wrist_pos, idxs)                   # (N, K, 3)
+        tw_rot_rotvec = gather_kt(traj.dex_wrist_rot, idxs)            # (N, K, 3)
+        tw_quat = _rotvec_to_quat_xyzw(tw_rot_rotvec.reshape(-1, 3))   # (N*K, 4)
+        tw_quat = tw_quat.reshape(N, K, 4)
+        tw_vel = (
+            gather_kt(traj.dex_wrist_velocity, idxs)
+            if traj.dex_wrist_velocity is not None
+            else torch.zeros_like(tw_pos)
+        )                                                              # (N, K, 3)
+        tw_ang_vel = (
+            gather_kt(traj.dex_wrist_angular_velocity, idxs)
+            if traj.dex_wrist_angular_velocity is not None
+            else torch.zeros_like(tw_pos)
+        )                                                              # (N, K, 3)
+
+        delta_wrist_pos = (tw_pos - cur_palm_pos[:, None]).reshape(N, -1)
+        delta_wrist_vel = (tw_vel - cur_palm_vel[:, None]).reshape(N, -1)
+        delta_wrist_ang_vel = (tw_ang_vel - cur_palm_ang_vel[:, None]).reshape(N, -1)
+        # Quat delta: cur * target.conj
+        # (matching paper line 946-949 ordering)
+        tw_quat_flat = tw_quat.reshape(N * K, 4)
+        cur_quat_rep = cur_palm_quat[:, None].repeat(1, K, 1).reshape(N * K, 4)
+        delta_wrist_quat = _quat_mul_xyzw(cur_quat_rep, _quat_conjugate_xyzw(tw_quat_flat))
+        delta_wrist_quat = delta_wrist_quat.reshape(N, -1)
+
+        # --- MANO joints block ---
+        # Target joints (T, 21, 3); current Sharpa joints from rigid_body_states
+        # via the same dex2mano mapping used in R_imit (27 non-wrist links).
+        rb_t = self.rigid_body_states
+        actual_28 = rb_t[:, self._imit_link_handles_t, :3]             # (N, 28, 3)
+        actual_27 = actual_28[:, 1:, :]                                # skip wrist (N, 27, 3)
+        if traj.joints_world is not None:
+            target_joints = gather_kt(traj.joints_world, idxs)         # (N, K, 21, 3)
+            target_joints_subset = target_joints[:, :, self._imit_target_mano_idx, :]  # (N, K, 27, 3)
+            delta_joints_pos = (target_joints_subset - actual_27[:, None]).reshape(N, -1)
+        else:
+            delta_joints_pos = torch.zeros(N, K * 27 * 3, device=self.device)
+        if traj.joints_velocity is not None:
+            target_joints_vel = gather_kt(traj.joints_velocity, idxs)  # (N, K, 21, 3)
+            target_joints_vel_subset = target_joints_vel[:, :, self._imit_target_mano_idx, :]
+            joints_vel = target_joints_vel_subset.reshape(N, -1)
+            # current Sharpa joint vel: rigid_body_states[..., 7:10] for the 27 links
+            actual_27_vel = rb_t[:, self._imit_link_handles_t[1:], 7:10]  # (N, 27, 3)
+            delta_joints_vel = (target_joints_vel_subset - actual_27_vel[:, None]).reshape(N, -1)
+        else:
+            joints_vel = torch.zeros(N, K * 27 * 3, device=self.device)
+            delta_joints_vel = torch.zeros(N, K * 27 * 3, device=self.device)
+
+        # --- Object block ---
+        to_pos = gather_kt(traj.object_goals, idxs)[..., 0:3]          # (N, K, 3)
+        to_quat = gather_kt(traj.object_goals, idxs)[..., 3:7]         # (N, K, 4) xyzw
+        to_vel = (
+            gather_kt(traj.obj_velocity, idxs)
+            if traj.obj_velocity is not None
+            else torch.zeros_like(to_pos)
+        )                                                               # (N, K, 3)
+        to_ang_vel = (
+            gather_kt(traj.obj_angular_velocity, idxs)
+            if traj.obj_angular_velocity is not None
+            else torch.zeros_like(to_pos)
+        )                                                               # (N, K, 3)
+
+        delta_obj_pos = (to_pos - cur_obj_pos[:, None]).reshape(N, -1)
+        delta_obj_vel = (to_vel - cur_obj_vel[:, None]).reshape(N, -1)
+        delta_obj_ang_vel = (to_ang_vel - cur_obj_ang_vel[:, None]).reshape(N, -1)
+        to_quat_flat = to_quat.reshape(N * K, 4)
+        cur_obj_quat_rep = cur_obj_quat[:, None].repeat(1, K, 1).reshape(N * K, 4)
+        delta_obj_quat = _quat_mul_xyzw(cur_obj_quat_rep, _quat_conjugate_xyzw(to_quat_flat))
+        delta_obj_quat = delta_obj_quat.reshape(N, -1)
+
+        # --- obj_to_joints (current state, not target-indexed) ---
+        # Distance from current obj to each MANO joint position (21 joints in
+        # actual hand frame).  Use the same 27 Sharpa link positions plus wrist.
+        all_28_pos = rb_t[:, self._imit_link_handles_t, :3]            # (N, 28, 3)
+        # subset to the 21 MANO equivalents
+        mano_subset = all_28_pos[:, [0] + (self._imit_target_mano_idx + 1).tolist()[:20], :]  # heuristic
+        if mano_subset.shape[1] < 21:
+            pad = torch.zeros(N, 21 - mano_subset.shape[1], 3, device=self.device)
+            mano_subset = torch.cat([mano_subset, pad], dim=1)
+        else:
+            mano_subset = mano_subset[:, :21, :]
+        obj_to_joints = torch.norm(
+            cur_obj_pos[:, None] - mano_subset, dim=-1
+        )                                                               # (N, 21)
+
+        # --- Concatenate (paper order) ---
+        target_obs = torch.cat(
+            [
+                delta_wrist_pos,                                       # N, K*3
+                tw_vel.reshape(N, -1),                                 # N, K*3
+                delta_wrist_vel,                                       # N, K*3
+                tw_quat.reshape(N, -1),                                # N, K*4
+                delta_wrist_quat,                                      # N, K*4
+                tw_ang_vel.reshape(N, -1),                             # N, K*3
+                delta_wrist_ang_vel,                                   # N, K*3
+                delta_joints_pos,                                      # N, K*27*3
+                joints_vel,                                            # N, K*27*3
+                delta_joints_vel,                                      # N, K*27*3
+                delta_obj_pos,                                         # N, K*3
+                to_vel.reshape(N, -1),                                 # N, K*3
+                delta_obj_vel,                                         # N, K*3
+                to_quat.reshape(N, -1),                                # N, K*4
+                delta_obj_quat,                                        # N, K*4
+                to_ang_vel.reshape(N, -1),                             # N, K*3
+                delta_obj_ang_vel,                                     # N, K*3
+                obj_to_joints,                                         # N, 21
+            ],
+            dim=-1,
+        )
+        return target_obs
 
     # ------------------------------------------------------------------
     # Properties for downstream code
@@ -1228,6 +1584,19 @@ class VideoRLFollower(SimToolReal):
 
     @property
     def hand_goal_obs_dim(self) -> int:
+        """Dimension of the extra goal-target block appended to obs.
+
+        - Legacy: 7 (wrist pose xyz+xyzw) + 3K (fingertip-local), K=5 → 22.
+        - Paper target (Tier 0): K_future × (23 wrist + 243 joints + 23 obj) + 21
+          (obj_to_joints).  For K_future=1 → 310 dims.
+        """
+        if bool(self.cfg["env"].get("paperTargetObs", True)):
+            Kf = int(self.cfg["env"].get("obsFutureLength", 1))
+            # Wrist deltas: K*(3+3+3+4+4+3+3) = K*23
+            # Joints deltas: K*(27*3 + 27*3 + 27*3) = K*243
+            # Obj deltas:    K*(3+3+3+4+4+3+3) = K*23
+            # Plus obj_to_joints (current state, not lookahead-indexed): 21
+            return Kf * (23 + 243 + 23) + 21
         return 7 + 3 * self._traj_K
 
     @property
