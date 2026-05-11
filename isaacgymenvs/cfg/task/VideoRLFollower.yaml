@@ -51,6 +51,11 @@ env:
   imitRewardScale:
     enable:           1.0
     eefPos:           0.1
+    # Coarse wrist-position term (lambda=4 → exp(-2)=0.13 at 50cm) so the
+    # policy gets gradient signal at >10cm.  Default 0 keeps the original
+    # paper reward; set >0 to enable.  See env.py:_compute_imit_reward.
+    eefPosWide:       0.0
+    lambdaEefPosWide: 4.0
     eefRot:           0.6
     thumbTip:         0.9
     indexTip:         0.8
@@ -126,9 +131,10 @@ env:
   resetDofPosRandomIntervalArm: 0.1
   resetDofVelRandomInterval: 0.5
 
-  # Table reset settings
-  tableResetZ: 0.38
-  tableResetZRange: 0.0    # zeroed: trajectory was preprocessed assuming fixed table_z=0.415
+  # Table reset settings — table_z=0.415 to match trajectory preprocessing
+  # (object_start_pose's z is computed assuming table center at 0.415).
+  tableResetZ: 0.415
+  tableResetZRange: 0.0
   tableObjectZOffset: 0.25
 
   # Random forces applied to the object

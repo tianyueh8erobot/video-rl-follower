@@ -131,6 +131,17 @@ class ReferenceTrajectory:
         dex_wrist_rot: Optional[torch.Tensor] = None,
         # Per-link names (so the env knows which q maps to which body)
         dex_link_names: Optional[List[str]] = None,
+        # Per-frame Kuka iiwa14 IK joint angles (T, 7) so reset_idx can warm-
+        # start the arm to the trajectory's wrist pose.  Computed offline by
+        # tools/compute_ik_for_trajectory.py.
+        kuka_dof_pos: Optional[torch.Tensor] = None,
+        # Actual wrist pose achieved by the IK solution (T, 3) / (T, 4 xyzw).
+        # Differs from `dex_wrist_pos` by the IK residual (~0-6cm at workspace
+        # boundaries).  reset_object_pose translates the object by
+        # `wrist_pos_ik - dex_wrist_pos` so the relative hand-object grasp
+        # config matches the retarget.
+        wrist_pos_ik: Optional[torch.Tensor] = None,
+        wrist_quat_ik: Optional[torch.Tensor] = None,
     ) -> None:
         self.meta = meta
         self.object_urdf_path = object_urdf_path
@@ -219,7 +230,26 @@ class ReferenceTrajectory:
         self.dex_link_names = list(dex_link_names) if dex_link_names is not None else None
         self.dex_wrist_pos = dex_wrist_pos.float() if dex_wrist_pos is not None else None
         self.dex_wrist_rot = dex_wrist_rot.float() if dex_wrist_rot is not None else None
+        if kuka_dof_pos is not None:
+            if kuka_dof_pos.ndim != 2 or kuka_dof_pos.shape != (T, 7):
+                raise ValueError(
+                    f"kuka_dof_pos must be shape ({T}, 7), got {tuple(kuka_dof_pos.shape)}"
+                )
+        self.kuka_dof_pos = kuka_dof_pos.float() if kuka_dof_pos is not None else None
+        self.wrist_pos_ik = wrist_pos_ik.float() if wrist_pos_ik is not None else None
+        self.wrist_quat_ik = wrist_quat_ik.float() if wrist_quat_ik is not None else None
         self.has_retargeted = self.dex_links_world is not None
+
+        # Frames where IK can land the wrist within `reachable_ik_threshold_m`
+        # of the trajectory's target.  Frames outside this set spawn the dex
+        # hand below the table (kuka workspace boundary) — random init must
+        # avoid them or the fingers penetrate at reset.  None when no IK data.
+        self.reachable_ik_threshold_m = 0.01  # 1 cm, configurable post-init
+        if self.wrist_pos_ik is not None and self.dex_wrist_pos is not None:
+            err = (self.wrist_pos_ik - self.dex_wrist_pos).norm(dim=-1)  # (T,)
+            self.reachable_frames = err < self.reachable_ik_threshold_m  # (T,) bool
+        else:
+            self.reachable_frames = None
 
     # ------------------------------------------------------------------
     # construction helpers
@@ -305,6 +335,18 @@ class ReferenceTrajectory:
                 dex_wrist_pos = torch.as_tensor(dex["wrist_pos"], dtype=torch.float32)
             if "wrist_rot" in dex:
                 dex_wrist_rot = torch.as_tensor(dex["wrist_rot"], dtype=torch.float32)
+            if "kuka_dof_pos" in dex:
+                _kuka_dof = torch.as_tensor(dex["kuka_dof_pos"], dtype=torch.float32)
+            else:
+                _kuka_dof = None
+            if "wrist_pos_ik" in dex:
+                _wrist_pos_ik = torch.as_tensor(dex["wrist_pos_ik"], dtype=torch.float32)
+            else:
+                _wrist_pos_ik = None
+            if "wrist_quat_ik" in dex:
+                _wrist_quat_ik = torch.as_tensor(dex["wrist_quat_ik"], dtype=torch.float32)
+            else:
+                _wrist_quat_ik = None
 
         return cls(
             meta=d.get("meta", {}),
@@ -324,6 +366,9 @@ class ReferenceTrajectory:
             dex_link_names=dex_link_names,
             dex_wrist_pos=dex_wrist_pos,
             dex_wrist_rot=dex_wrist_rot,
+            kuka_dof_pos=_kuka_dof,
+            wrist_pos_ik=_wrist_pos_ik,
+            wrist_quat_ik=_wrist_quat_ik,
         )
 
     # ------------------------------------------------------------------
@@ -344,6 +389,20 @@ class ReferenceTrajectory:
             self.dex_links_world = self.dex_links_world.to(device)
         if self.dex_dof_pos is not None:
             self.dex_dof_pos = self.dex_dof_pos.to(device)
+        if self.kuka_dof_pos is not None:
+            self.kuka_dof_pos = self.kuka_dof_pos.to(device)
+        if self.wrist_pos_ik is not None:
+            self.wrist_pos_ik = self.wrist_pos_ik.to(device)
+        if self.wrist_quat_ik is not None:
+            self.wrist_quat_ik = self.wrist_quat_ik.to(device)
+        if self.dex_wrist_pos is not None:
+            self.dex_wrist_pos = self.dex_wrist_pos.to(device)
+        if self.dex_wrist_rot is not None:
+            self.dex_wrist_rot = self.dex_wrist_rot.to(device)
+        if self.reachable_frames is not None:
+            self.reachable_frames = self.reachable_frames.to(device)
+        if self.dex_links_world is not None:
+            self.dex_links_world = self.dex_links_world.to(device)
         return self
 
     # ------------------------------------------------------------------

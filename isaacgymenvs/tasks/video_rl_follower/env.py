@@ -26,11 +26,14 @@ Reset (ManipTrans Stage-2 style):
     arm_hand_dof_pos[env, 7:7+22] = opt_dof_pos[seq_idx]   # warm-start hand
     (arm DOFs left at SimToolReal-randomized default — no IK to opt_wrist_pos)
 
-Sub-goal advancement:
+Sub-goal advancement (★ TRACKING BRANCH ★):
 
-  on success (keypoints_max_dist <= tolerance for N consecutive sim steps):
-    sub_goal_idx[env]   = (sub_goal_idx[env] + 1) % T      # ★ next frame
-    successes[env]     += 1                                  # stats only
+  Every physics step:
+    sub_goal_idx[env]   = min(sub_goal_idx[env] + 1, T - 1)  # time-driven
+    (no longer success-driven — paper's progress_buf-equivalent)
+
+  This matches ManipTrans paper (dexhandmanip_sh.py:1333 `progress_buf += 1`).
+  Policy MUST keep up with trajectory's pace — no "sit still and dwell" plateau.
 
 The base class still runs its compute_kuka_reward(), but ``cfg.env`` zeroes
 out the dense pickup terms (liftingRewScale=0, liftingBonus=0,
@@ -186,6 +189,12 @@ class VideoRLFollower(SimToolReal):
         self.w_imit_pinky_tip    = float(ir.get("pinkyTip",    0.6))
         self.w_imit_level_1      = float(ir.get("level1",      0.5))
         self.w_imit_level_2      = float(ir.get("level2",      0.3))
+        # Coarse wrist-position term (lambda~4) so policy gets gradient signal
+        # at >10cm from goal — paper's lambdaEefPos=40 saturates beyond ~10cm
+        # because their floating-base setup teleports the wrist to opt_wrist_pos
+        # at reset, while we have a Kuka arm with no IK warm-start.
+        self.w_imit_eef_pos_wide      = float(ir.get("eefPosWide",        0.0))
+        self.lambda_imit_eef_pos_wide = float(ir.get("lambdaEefPosWide",  4.0))
         # Decay rates (paper):
         self.lambda_imit_eef_pos    = float(ir.get("lambdaEefPos",     40.0))
         self.lambda_imit_eef_rot    = float(ir.get("lambdaEefRot",      1.0))
@@ -220,6 +229,25 @@ class VideoRLFollower(SimToolReal):
         self.random_state_init = bool(
             cfg["env"].get("randomStateInit", True)
         )
+        # Optional ceiling on the random-init seq_idx (≥ 0; -1 = no ceiling).
+        # Combined with the trajectory's reachable_frames mask: init seq_idx
+        # ∈ {f : reachable[f] AND f ≤ randomInitMaxIdx}.  Use this as a
+        # curriculum knob — narrow the init range to the early lift phase
+        # while the policy is learning, then widen.
+        self.random_init_max_idx = int(
+            cfg["env"].get("randomInitMaxIdx", -1)
+        )
+        # Relax the dex DOF warm-start toward the open-hand neutral pose by
+        # this factor (1.0 = paper-exact closed grasp, <1.0 backs fingers off).
+        # Mitigates IK-error-induced contact penetration: the kuka can't land
+        # the wrist at the trajectory's exact target (~1cm error even for
+        # reachable frames), so a closed-on-the-target grasp ends up slightly
+        # offset from the actual object → finger overlap → PhysX ejection.
+        # 0.9 ≈ 10% relaxation gives finger clearance without spoiling the
+        # warm-start signal.  Applied only when useRetargetDofInit=True.
+        self.dof_init_relax_scale = float(
+            cfg["env"].get("dofInitRelaxScale", 1.0)
+        )
 
         # ----- Force fixed-goal mode -----
         # The base class only ever reads trajectory_states[..., 0:7] for the
@@ -230,13 +258,20 @@ class VideoRLFollower(SimToolReal):
         ]
         cfg["env"]["maxConsecutiveSuccesses"] = self._trajectory.num_goals
 
-        # NOTE: do NOT seed cfg.env.objectStartPose from the trajectory's
-        # frame-0 pose.  Per SimToolReal paper Section III.B, the object
-        # starts on the table at episode reset (so the policy learns to
-        # grasp first).  The trajectory drives the GOAL sequence via
-        # sub_goal_idx, not the init pose.  Letting cfg.env.objectStartPose
-        # stay at its yaml default (or be sampled by SimToolReal's
-        # _object_start_pose) keeps that semantics.
+        # Seed cfg.env.objectStartPose from the trajectory's frame-0 pose so
+        # the object spawns where the trajectory expects it (already on the
+        # table at the trajectory's table_z).  Without this, SimToolReal's
+        # default `tableResetZ + tableObjectZOffset` puts the object 11cm
+        # above the trajectory's expected pose, leaving a constant ~20cm
+        # d_obj_pos gap the policy can't close (object doesn't reach goal
+        # without manipulation, but hand can't manipulate without first
+        # closing arm).  SimToolReal §III.B's "random table object" applies
+        # to their grasping task; ours is trajectory tracking.
+        if self._trajectory.object_start_pose is not None:
+            cfg["env"]["objectStartPose"] = [
+                float(v) for v in self._trajectory.object_start_pose.tolist()
+            ]
+        cfg["env"]["useFixedInitObjectPose"] = True  # don't add SimToolReal noise
 
         # ----- Trajectory-driven object asset (URDF) selection -----
         self._use_trajectory_object = bool(
@@ -586,18 +621,51 @@ class VideoRLFollower(SimToolReal):
         self._wrist_goal[env_ids] = self._trajectory.wrist_goals[idx]
         self._fingertip_goal_local[env_ids] = self._trajectory.fingertip_local[idx]
 
-    # NOTE: We intentionally do NOT override reset_object_pose.  Per the
-    # SimToolReal paper (arXiv:2602.16863, Section III.B): "we place a
-    # randomly selected object on the table in a random pose and initialize
-    # the robot in a randomized joint configuration ... The robot must first
-    # learn to grasp the object from the flat table surface".  ManipTrans's
-    # alternative — placing the object at trajectory[seq_idx] — only works
-    # because their floating-base dexhand can be teleported to opt_wrist_pos
-    # to grip the object at episode start.  Our SimToolReal-Kuka robot can't
-    # do that without arm IK (deferred to V2), so the SimToolReal recipe is
-    # the right one: object on table, policy learns to grasp first.  The
-    # trajectory drives the GOAL sequence (handled by _reset_target →
-    # sub_goal_idx), not the initial object pose.
+    # ManipTrans Stage-2 style reset_object_pose: when the trajectory has
+    # IK warm-start data (`kuka_dof_pos` + `wrist_pos_ik`), place the object
+    # at trajectory[seq_idx].object_pose translated by the IK residual
+    # (wrist_pos_ik - dex.wrist_pos), so the relative hand-object grasp
+    # configuration matches the retarget exactly even when our 7-DoF Kuka
+    # arm IK has 0-6cm error.  Without IK data, fall back to parent
+    # SimToolReal default (object at cfg.objectStartPose).
+    def reset_object_pose(self, env_ids, reset_buf_idxs=None, tensor_reset=True):
+        traj = self._trajectory
+        use_traj_obj_init = (
+            traj.kuka_dof_pos is not None
+            and traj.wrist_pos_ik is not None
+            and self._cached_reset_seq_idx is not None
+            and tensor_reset
+            and reset_buf_idxs is None
+            and len(env_ids) > 0
+        )
+        if not use_traj_obj_init:
+            return super().reset_object_pose(env_ids, reset_buf_idxs=reset_buf_idxs,
+                                              tensor_reset=tensor_reset)
+        # Per-env target object pose from trajectory
+        seq_idx = self._cached_reset_seq_idx           # (E,)
+        obj_pose = traj.object_goals[seq_idx]          # (E, 7) xyz+xyzw
+        # IK residual: how far the kuka actually puts the wrist vs paper target
+        ik_delta = traj.wrist_pos_ik[seq_idx] - traj.dex_wrist_pos[seq_idx]  # (E, 3)
+        obj_pos = obj_pose[:, :3] + ik_delta           # (E, 3) compensated
+        obj_quat = obj_pose[:, 3:7]                    # (E, 4) keep paper quat
+        # Push into root_state_tensor for object actor only.
+        obj_indices = self.object_indices[env_ids]
+        self.root_state_tensor[obj_indices, 0:3] = obj_pos
+        self.root_state_tensor[obj_indices, 3:7] = obj_quat
+        self.root_state_tensor[obj_indices, 7:10] = 0.0   # zero linvel
+        self.root_state_tensor[obj_indices, 10:13] = 0.0  # zero angvel
+        # Also update object_init_state cache so any downstream readers stay
+        # consistent (e.g., reach-goal logic that diff-tracks against init).
+        self.object_init_state[env_ids, 0:3] = obj_pos
+        self.object_init_state[env_ids, 3:7] = obj_quat
+        # Table init kept at cfg.tableResetZ (already paper-aligned).
+        table_indices = self.table_indices[env_ids]
+        self.root_state_tensor[table_indices] = self.table_init_state[env_ids].clone()
+        # Defer the actor-root push to vec_task's deferred queue (parent
+        # already owns this bookkeeping in reset_idx; we just need to make
+        # sure both objects are in the next set_actor_root_state call).
+        self.deferred_set_actor_root_state_tensor_indexed([obj_indices])
+        self.deferred_set_actor_root_state_tensor_indexed([table_indices])
 
     def _reset_target(
         self,
@@ -619,6 +687,17 @@ class VideoRLFollower(SimToolReal):
         if len(env_ids) > 0 and reset_buf_idxs is None and tensor_reset:
             idx = self.sub_goal_idx[env_ids]
             self.goal_states[env_ids, 0:7] = self.trajectory_states[idx, 0:7]
+            # Compensate the success-target object position by the kuka IK
+            # residual: when our IK can't put the wrist exactly at the paper
+            # opt_wrist_pos, the dex-carried object will land 0-6cm offset
+            # from paper_obj_pose.  Shift the goal so a perfectly-tracking
+            # policy gets d_obj=0 (otherwise succeeding requires a 7.5cm
+            # window minus up to 6cm IK error = 1.5cm margin → reset/success
+            # noise dominates).  Only applies when trajectory has IK data.
+            traj = self._trajectory
+            if traj.wrist_pos_ik is not None and traj.dex_wrist_pos is not None:
+                ik_delta = traj.wrist_pos_ik[idx] - traj.dex_wrist_pos[idx]  # (E, 3)
+                self.goal_states[env_ids, 0:3] = self.goal_states[env_ids, 0:3] + ik_delta
             # NOTE: we intentionally do NOT call _clip_goal_z() here.  That
             # method clamps z to a table-surface minimum, which would corrupt
             # the exact frame-aligned object pose the user explicitly asked
@@ -645,13 +724,35 @@ class VideoRLFollower(SimToolReal):
                 and reset_buf_idxs is None):
             T = self._trajectory.num_goals
             if self.random_state_init and T > 1:
-                seq_idx = torch.randint(
-                    0, T, (len(env_ids),), device=self.device, dtype=torch.long
-                )
+                # Sample only from frames where the kuka can land the wrist
+                # within ~1cm of the trajectory's target (workspace boundary
+                # frames drop the wrist below the table → finger penetration).
+                # Frames outside the reachable set are still visited via
+                # natural sub_goal advancement after success.
+                reachable = self._trajectory.reachable_frames
+                if reachable is not None and bool(reachable.any()):
+                    choices = torch.nonzero(reachable, as_tuple=False).squeeze(-1)
+                    if self.random_init_max_idx >= 0:
+                        choices = choices[choices <= self.random_init_max_idx]
+                    pick = torch.randint(
+                        0, choices.numel(), (len(env_ids),),
+                        device=self.device, dtype=torch.long,
+                    )
+                    seq_idx = choices[pick].long()
+                else:
+                    seq_idx = torch.randint(
+                        0, T, (len(env_ids),), device=self.device, dtype=torch.long
+                    )
             else:
                 seq_idx = torch.zeros(
                     len(env_ids), device=self.device, dtype=torch.long
                 )
+            # ★ TRACKING BRANCH: warm-start state to trajectory[seq_idx],
+            # set sub_goal_idx = seq_idx (matches env state).  Time-driven
+            # advance in compute_kuka_reward will increment it next step,
+            # forcing policy to move object forward by per-frame motion.
+            # Mirrors paper's `progress_buf[env_ids] = seq_idx` at reset
+            # (dexhandimitator.py:831, dexhandmanip_sh.py:1145).
             self.sub_goal_idx[env_ids] = seq_idx
             self._cached_reset_seq_idx = seq_idx     # consumed below
         else:
@@ -698,6 +799,10 @@ class VideoRLFollower(SimToolReal):
                     "would break the warm-start — fix the retarget pkl or env."
                 )
             hand_dof = self._trajectory.dex_dof_pos[seq_idx]         # (E, n_hand)
+            # Optional relaxation: scale toward 0 (open neutral) to give
+            # finger clearance from the IK-shifted object — see field doc.
+            if self.dof_init_relax_scale != 1.0:
+                hand_dof = hand_dof * self.dof_init_relax_scale
             # Clamp to dexhand DOF limits (paper safety).
             lo = self.arm_hand_dof_lower_limits[n_arm:n_arm + n_hand_env]
             hi = self.arm_hand_dof_upper_limits[n_arm:n_arm + n_hand_env]
@@ -706,6 +811,22 @@ class VideoRLFollower(SimToolReal):
             self.arm_hand_dof_vel[env_ids, n_arm:n_arm + n_hand_env] = 0.0
             self.prev_targets[env_ids, n_arm:n_arm + n_hand_env] = hand_dof
             self.cur_targets[env_ids, n_arm:n_arm + n_hand_env] = hand_dof
+
+            # Kuka 7-DoF arm warm-start from offline IK (ManipTrans Stage-2's
+            # floating-base equivalent for our arm-mounted robot).  Without
+            # this the wrist starts ~50cm from the trajectory's expected
+            # opt_wrist_pos and the policy plateaus on the slide-then-grab
+            # phase (sub_goal_idx ≤ 6 of 14) because it can't drive the arm
+            # close enough to follow the lift.
+            if self._trajectory.kuka_dof_pos is not None:
+                kuka_dof = self._trajectory.kuka_dof_pos[seq_idx]   # (E, 7)
+                lo_arm = self.arm_hand_dof_lower_limits[:n_arm]
+                hi_arm = self.arm_hand_dof_upper_limits[:n_arm]
+                kuka_dof = torch.clamp(kuka_dof, lo_arm, hi_arm)
+                self.arm_hand_dof_pos[env_ids, :n_arm] = kuka_dof
+                self.arm_hand_dof_vel[env_ids, :n_arm] = 0.0
+                self.prev_targets[env_ids, :n_arm] = kuka_dof
+                self.cur_targets[env_ids, :n_arm] = kuka_dof
             # NOTE: do NOT re-push set_dof_position_target_tensor_indexed
             # here.  Earlier we did (worried about super's already-pushed
             # random targets fighting our warm-start state), but the policy's
@@ -801,15 +922,31 @@ class VideoRLFollower(SimToolReal):
         eef_pos_target = self._wrist_goal[:, :3]                  # (N, 3) (MANO wrist)
         d_eef_pos = (eef_pos - eef_pos_target).norm(dim=-1)
         r_eef_pos = torch.exp(-self.lambda_imit_eef_pos * d_eef_pos)
+        r_eef_pos_wide = torch.exp(-self.lambda_imit_eef_pos_wide * d_eef_pos)
 
         eef_quat = self._palm_state[:, 3:7]
         eef_quat_target = self._wrist_goal[:, 3:7]
         eef_rot_angle = _quat_geodesic_angle_xyzw(eef_quat, eef_quat_target)
         r_eef_rot = torch.exp(-self.lambda_imit_eef_rot * eef_rot_angle)
 
+        # ── Object position + rotation reward (paper's DOMINANT terms) ──
+        # dexhandmanip_sh.py:1481-1494: 5.0 * exp(-80 * obj_pos_dist) +
+        # 1.0 * exp(-3 * obj_rot_angle).  These drive the trajectory tracking
+        # signal — without them R_imit only optimizes hand pose, not object.
+        cur_obj_pos = self.object_state[:, :3]
+        target_obj_pos = self._trajectory.object_goals[idx][:, :3]
+        diff_obj_pos_dist = (cur_obj_pos - target_obj_pos).norm(dim=-1)
+        r_obj_pos = torch.exp(-80.0 * diff_obj_pos_dist)
+
+        cur_obj_quat = self.object_state[:, 3:7]
+        target_obj_quat = self._trajectory.object_goals[idx][:, 3:7]
+        diff_obj_rot_angle = _quat_geodesic_angle_xyzw(cur_obj_quat, target_obj_quat)
+        r_obj_rot = torch.exp(-3.0 * diff_obj_rot_angle)
+
         r_imit = (
-            self.w_imit_eef_pos    * r_eef_pos
-          + self.w_imit_eef_rot    * r_eef_rot
+            self.w_imit_eef_pos      * r_eef_pos
+          + self.w_imit_eef_pos_wide * r_eef_pos_wide
+          + self.w_imit_eef_rot      * r_eef_rot
           + self.w_imit_thumb_tip  * r_thumb_tip
           + self.w_imit_index_tip  * r_index_tip
           + self.w_imit_middle_tip * r_middle_tip
@@ -817,14 +954,25 @@ class VideoRLFollower(SimToolReal):
           + self.w_imit_pinky_tip  * r_pinky_tip
           + self.w_imit_level_1    * r_level_1
           + self.w_imit_level_2    * r_level_2
+          + 5.0 * r_obj_pos                   # paper coefficient
+          + 1.0 * r_obj_rot                   # paper coefficient
         )
 
-        # Cache for episode logging.
+        # Cache for episode logging + termination logic in compute_kuka_reward.
         self._last_imit_components = dict(
             r_eef_pos=r_eef_pos,    r_eef_rot=r_eef_rot,
             r_thumb_tip=r_thumb_tip, r_index_tip=r_index_tip,
             r_middle_tip=r_middle_tip, r_ring_tip=r_ring_tip, r_pinky_tip=r_pinky_tip,
             r_level_1=r_level_1, r_level_2=r_level_2,
+            r_obj_pos=r_obj_pos, r_obj_rot=r_obj_rot,
+        )
+        # Cache distances for paper-style failed_execute termination.
+        self._last_imit_dists = dict(
+            d_obj_pos=diff_obj_pos_dist,
+            d_obj_rot=diff_obj_rot_angle,
+            d_thumb_tip=d_thumb_tip, d_index_tip=d_index_tip,
+            d_middle_tip=d_middle_tip, d_ring_tip=d_ring_tip, d_pinky_tip=d_pinky_tip,
+            d_level_1=d_level_1, d_level_2=d_level_2,
         )
         return r_imit
 
@@ -947,7 +1095,33 @@ class VideoRLFollower(SimToolReal):
         #    reward on the success step itself — that's the desired credit.
         r_imit = self._maniptrans_imit_reward()
 
-        # 4) Combine.
+        # 4) ★ TRACKING BRANCH: paper-style failed_execute termination.
+        #    dexhandmanip_sh.py:1528-1542: bail out of an episode if any
+        #    tracking distance exceeds a threshold (after an 8-step grace
+        #    period).  This forces the policy to actually stay on trajectory;
+        #    without it, the env keeps running far off-trajectory and the
+        #    R_imit signal saturates near zero (no useful gradient).
+        if hasattr(self, "_last_imit_dists"):
+            d = self._last_imit_dists
+            grace = (self.progress_buf >= 8)
+            paper_failed = (
+                (d["d_obj_pos"] > 0.10)                          # 10cm  (paper 5.83cm; we loosen for arm IK error)
+                | (d["d_thumb_tip"]  > 0.08)                     # 8cm
+                | (d["d_index_tip"]  > 0.08)
+                | (d["d_middle_tip"] > 0.08)
+                | (d["d_ring_tip"]   > 0.10)
+                | (d["d_pinky_tip"]  > 0.10)
+                | (d["d_level_1"]    > 0.10)
+                | (d["d_level_2"]    > 0.12)
+                | (d["d_obj_rot"] * 180.0 / 3.14159265 > 90.0)   # 90°
+            ) & grace
+            self.reset_buf = self.reset_buf | paper_failed
+
+        # 5) Combine.  ★ TRACKING BRANCH: rew_buf from super is mostly action +
+        #    velocity penalties + (small) sparse goal bonus when configured;
+        #    the dominant signal is now r_imit (which itself is dominated by
+        #    the 5.0 * r_obj_pos term).  Set cfg.reachGoalBonus low (e.g. 0)
+        #    to fully delegate to dense reward, paper-style.
         combined = rew_buf + self.w_imit * r_imit
 
         # 4b) Strict-correctness check on BOTH r_imit and the combined reward.
@@ -976,25 +1150,27 @@ class VideoRLFollower(SimToolReal):
         if not bool(self.cfg["env"].get("disableExtraMetrics", False)):
             self._write_diagnostic_metrics(is_success, r_imit)
 
-        # 5) ★ Phase fix (Codex round 2): advance sub_goal_idx for SUCCESS envs
-        #    NOW so populate_obs_and_states_buffers (which runs immediately
-        #    after this in post_physics_step) packs the FRESH goal into obs.
-        #    Without this the policy would see the stale (just-achieved) goal
-        #    for one full control step.  _reset_target (called next tick from
-        #    pre_physics_step) is now a pure copy and will not double-advance.
-        success_env_ids = is_success.nonzero(as_tuple=False).squeeze(-1)
-        if success_env_ids.numel() > 0:
-            T = self._trajectory.num_goals
-            self.sub_goal_idx[success_env_ids] = (
-                self.sub_goal_idx[success_env_ids] + 1
-            ) % T
-            # Refresh per-env hand goal cache so populate_obs sees the new
-            # frame's wrist + fingertip-local targets.
-            self._set_hand_goal_from_trajectory(success_env_ids)
-            # Also refresh object goal_states so any consumer (e.g. logging)
-            # sees the fresh frame.
-            new_idx = self.sub_goal_idx[success_env_ids]
-            self.goal_states[success_env_ids, 0:7] = self.trajectory_states[
+        # 5) ★ TRACKING BRANCH: time-driven sub_goal advancement.
+        #    Every step (NOT just on success) we advance sub_goal_idx by 1,
+        #    clamped at T-1.  This forces the policy to keep up with the
+        #    trajectory's pace — there's no "stay still until the goal moves
+        #    to me" loophole that plagued the success-driven version.
+        #    Mirrors paper's `self.progress_buf += 1` in post_physics_step
+        #    (dexhandmanip_sh.py:1333).
+        T = self._trajectory.num_goals
+        # Only advance envs that haven't been reset this step (reset_buf=0).
+        # Envs being reset will have their sub_goal_idx set to seq_idx in
+        # the upcoming reset_idx call.
+        not_resetting = (self.reset_buf == 0).nonzero(as_tuple=False).squeeze(-1)
+        if not_resetting.numel() > 0:
+            self.sub_goal_idx[not_resetting] = torch.clamp(
+                self.sub_goal_idx[not_resetting] + 1, max=T - 1
+            )
+            # Refresh per-env hand goal cache + object goal_states so
+            # populate_obs sees the fresh frame.
+            self._set_hand_goal_from_trajectory(not_resetting)
+            new_idx = self.sub_goal_idx[not_resetting]
+            self.goal_states[not_resetting, 0:7] = self.trajectory_states[
                 new_idx, 0:7
             ]
 
