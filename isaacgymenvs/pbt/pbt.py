@@ -40,11 +40,29 @@ import numpy as np
 import torch
 import yaml
 from omegaconf import DictConfig, open_dict
-from rl_games.algos_torch.torch_ext import safe_filesystem_op, safe_save, safe_symlink
+from rl_games.algos_torch.torch_ext import safe_filesystem_op, safe_save
+try:
+    from rl_games.algos_torch.torch_ext import safe_symlink  # newer rl_games
+except ImportError:
+    # Older rl_games (< whatever introduced safe_symlink): stub it locally.
+    import os as _os
+    def safe_symlink(target, link_name):
+        if _os.path.islink(link_name) or _os.path.exists(link_name):
+            try: _os.remove(link_name)
+            except OSError: pass
+        return _os.symlink(target, link_name)
 from rl_games.common.algo_observer import AlgoObserver
 
 from isaacgymenvs.pbt.mutation import mutate
-from rl_games.common.custom_utils import remove_envs_from_info
+try:
+    from rl_games.common.custom_utils import remove_envs_from_info
+except ImportError:
+    # rl_games without custom_utils — stub.  PBT path uses this; we don't use
+    # PBT for DexTrackSharpa, so stub is OK.
+    def remove_envs_from_info(*args, **kwargs):
+        raise NotImplementedError("rl_games.common.custom_utils.remove_envs_from_info "
+                                   "not available; install a matching rl_games "
+                                   "version if you want to use PBT")
 from isaacgymenvs.utils.reformat import omegaconf_to_dict
 from isaacgymenvs.utils.utils import flatten_dict, project_tmp_dir, safe_ensure_dir_exists
 

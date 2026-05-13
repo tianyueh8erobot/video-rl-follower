@@ -80,6 +80,16 @@ params:
     summaries_interval_sec_min: 5
     summaries_interval_sec_max: 300
 
+    # Extra cfg keys this fork's train.py expects (matches VideoRLFollowerPPO.yaml).
+    good_reset_boundary: 0
+    use_others_experience: 'none'
+    off_policy_ratio: 1.0
+    expl_type: 'none'
+    expl_reward_coef_embd_size: 32
+    expl_reward_coef_scale: 1.0
+    expl_reward_type: rnd
+    expl_coef_block_size: 4096
+
     player:
       deterministic: False
       games_num: 1000

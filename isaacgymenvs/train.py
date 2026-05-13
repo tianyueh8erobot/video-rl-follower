@@ -32,6 +32,12 @@
 import os
 import sys
 
+# IsaacGym must load BEFORE torch.  Some package on the way to launch_rlg_hydra
+# (e.g. transitive rl_games import) pulls torch first when running with
+# headless=False; load isaacgym at module top to defuse the
+# "PyTorch was imported before isaacgym modules" ImportError.
+import isaacgym  # noqa: F401  (must precede any torch import)
+
 import hydra
 import yaml
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -103,7 +109,17 @@ def launch_rlg_hydra(cfg: DictConfig, vec_env=None):
     # noinspection PyUnresolvedReferences
     from hydra.utils import to_absolute_path
 
-    from isaacgymenvs.pbt.pbt import PbtAlgoObserver, initial_pbt_check
+    # PBT (Population Based Training) is optional; the local pbt.py imports
+    # a `safe_symlink` symbol that's missing from some installed rl_games
+    # versions.  We don't use PBT in DexTrackSharpa training, so fail soft.
+    try:
+        from isaacgymenvs.pbt.pbt import PbtAlgoObserver, initial_pbt_check
+    except ImportError as _e:
+        if cfg.pbt.enabled:
+            raise
+        PbtAlgoObserver = None
+        initial_pbt_check = lambda c: None
+        print(f"[train] pbt import skipped (cfg.pbt.enabled=False): {_e}")
     from isaacgymenvs.tasks import isaacgym_task_map
     from isaacgymenvs.utils.reformat import omegaconf_to_dict, print_dict
     from isaacgymenvs.utils.utils import set_np_formatting, set_seed
@@ -252,7 +268,10 @@ def launch_rlg_hydra(cfg: DictConfig, vec_env=None):
     # create runner and set the settings
     runner = Runner(MultiObserver(observers))
     runner.load(rlg_config_dict)
-    runner.set_vec_env(vec_env)
+    # Newer/older rl_games drops `set_vec_env` — only call if available and
+    # only useful when caller passed a pre-built env (PBT restart path).
+    if vec_env is not None and hasattr(runner, "set_vec_env"):
+        runner.set_vec_env(vec_env)
     runner.reset()
 
     # dump config dict
