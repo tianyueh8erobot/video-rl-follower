@@ -52,7 +52,17 @@ env:
       finger_dist_cap:        0.6
       wrist_dist_cap:         0.5
       reach_goal_bonus:       0.0           # DexTrack default: no extra sparse bonus
-      early_terminate_obj_dist: 0.0         # 0 disables; DexTrack uses 0.2m drift
+      early_terminate_obj_dist: 0.2         # DexTrack paper default; 0 disables
+      # target_flag sanity (3-of-3 gate for goal_hand_rew, paper L12762):
+      target_flag_pos_thresh:  0.4
+      target_flag_rot_thresh:  1.0
+      target_flag_qpos_thresh: 6.0
+      # hand_up term (paper L12811-12832): rewards continued lifting.
+      hand_up_thresh_1:       0.18           # lift_z threshold for first stage
+      hand_up_thresh_2:       0.20           # higher threshold for flat 0.2 reward
+      hand_up_action_idx:     0              # which action dim is wrist-z residual (Franka joint 0 ≈ shoulder pan; tune)
+      # Smoothness (paper L12780, opt-in).
+      smoothness_coef:        0.0
     maniptrans:
       failed_execute_enabled: True
       failed_execute_progress_threshold: 20
