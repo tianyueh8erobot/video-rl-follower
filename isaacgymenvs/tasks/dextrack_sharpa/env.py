@@ -375,6 +375,8 @@ class DexTrackSharpa(VecTask):
         subtree, while pytorch_kinematics yields them in URDF DFS order.  We
         build a per-joint permutation `pk_idx = pk_to_ig[ig_idx]` and apply
         it as `dof_pos_ig[i] = dof_pos_pk[pk_to_ig[i]]`.
+
+        Full background: docs/ISAACGYM_GOTCHAS.md  §1.
         """
         env_ptr     = self.envs[0]
         robot_actor = self.gym.find_actor_handle(env_ptr, "robot")

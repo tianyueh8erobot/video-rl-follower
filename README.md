@@ -79,6 +79,15 @@ python tools/build_iiwa14_right_sharpa_urdf.py \
 > intended direction; tweak the `sharpa_mount_to_right_flange` joint origin if
 > not.
 
+## Gotchas
+
+**Read [`docs/ISAACGYM_GOTCHAS.md`](docs/ISAACGYM_GOTCHAS.md) before touching
+the IsaacGym task code.** The top entry — IsaacGym sorts URDF DOFs
+alphabetically while PyBullet / pytorch_kinematics / MuJoCo preserve URDF
+DFS order — silently corrupts both visualisation AND training when a
+trajectory authored against PK order is fed straight into `set_dof_state`.
+Cost us a day; future-you will thank present-you.
+
 ## Setup
 
 Same dependency tree as SimToolReal (IsaacGym Preview 4 + IsaacGymEnvs +
