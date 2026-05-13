@@ -58,8 +58,15 @@ class DexTrackSharpa(VecTask):
         assert self.reward_style in ("maniptrans", "dextrack"), \
             f"reward_style must be 'maniptrans' or 'dextrack', got {self.reward_style}"
 
-        # Residual control parameters
-        self.action_scale      = env_cfg.get("actionScale", 0.1)
+        # Residual control parameters — DexTrack accumulating-residual semantics.
+        # delta_delta_targets = speed_scale_per_joint × dt × action × 2 × ctlFreqInv
+        # cur_delta_targets_warm += delta_delta_targets         (running sum)
+        # target = ref + cur_delta_targets_warm
+        # speed_scale_per_joint (wfranka):
+        #   arm 7-DOF : dofSpeedScale × frankaDeltaDeltaMultCoef = 20 × 2 = 40
+        #   hand 22-DOF: dofSpeedScale = 20
+        self.dof_speed_scale   = env_cfg.get("dofSpeedScale", 20.0)
+        self.franka_delta_mult = env_cfg.get("frankaDeltaDeltaMultCoef", 2.0)
         self.action_moving_avg = env_cfg.get("actionMovingAverage", 1.0)
 
         # DexTrack-style one-shot progress scattering on first reset
@@ -80,10 +87,12 @@ class DexTrackSharpa(VecTask):
         self.dextrack_rew_kwargs   = rew_cfg.get("dextrack",   {})
         self.maniptrans_rew_kwargs = rew_cfg.get("maniptrans", {})
 
-        # Object / table
+        # Object / table.  DexTrack supplies rigid_obj_density=500 and lets
+        # IsaacGym compute mass from density × mesh volume (paper L471).
+        # For cubesmall (5cm cube, vol=1.25e-4 m³): mass = 0.0625 kg.
         obj_cfg = env_cfg["object"]
-        self.object_size = obj_cfg.get("size", [0.05, 0.05, 0.05])  # cubesmall ≈ 5cm
-        self.object_mass = obj_cfg.get("mass", 0.18)                # GRAB cube ≈ 180g
+        self.object_size    = obj_cfg.get("size",    [0.05, 0.05, 0.05])
+        self.object_density = obj_cfg.get("density", 500.0)
         self.object_friction = obj_cfg.get("friction", 1.0)
 
         table_cfg = env_cfg.get("table", {})
@@ -155,6 +164,18 @@ class DexTrackSharpa(VecTask):
         self.cur_targets  = torch.zeros(self.num_envs, NUM_DOFS, device=self.device)
         # Raw policy action from the last step (used by DexTrack r_delta_hand)
         self.last_actions = torch.zeros(self.num_envs, NUM_DOFS, device=self.device)
+        # Accumulating residual on top of the kinematic reference (DexTrack
+        # cur_delta_targets_warm, L12220-12225).
+        self.cur_delta_targets_warm = torch.zeros(self.num_envs, NUM_DOFS, device=self.device)
+        # Per-joint speed scale (wfranka path): arm × mult, hand × 1.
+        speed_scale = [self.dof_speed_scale * self.franka_delta_mult] * NUM_ARM_DOFS \
+                    + [self.dof_speed_scale] * NUM_HAND_DOFS
+        self.dof_speed_scale_tsr = torch.tensor(speed_scale, dtype=torch.float32,
+                                                 device=self.device)
+        # Control-frequency inverse (multiplied into delta_delta_targets, paper L12219).
+        self.control_freq_inv = env_cfg.get("controlFrequencyInv", 1)
+        # Sim dt (used in the residual formula).  Default 1/60 matches DexTrack.
+        self.sim_dt = self.cfg.get("sim", {}).get("dt", 1.0 / 60.0)
 
         # Trajectory loader (single fixed trajectory, shared across envs)
         self.traj = DexTrackTrajectory(self.trajectory_npy, self.urdf_path,
@@ -249,9 +270,10 @@ class DexTrackSharpa(VecTask):
         self.robot_body_name_to_idx = None
 
         # --- Object asset (box, free body) ---
+        # Density-based mass (DexTrack convention); for cubesmall (5cm cube)
+        # the geometry is equivalent to the GRAB cubesmall.obj mesh.
         obj_opts = gymapi.AssetOptions()
-        obj_opts.density = self.object_mass / (
-            self.object_size[0] * self.object_size[1] * self.object_size[2])
+        obj_opts.density = self.object_density
         object_asset = self.gym.create_box(self.sim,
             self.object_size[0], self.object_size[1], self.object_size[2], obj_opts)
         self.num_object_bodies = self.gym.get_asset_rigid_body_count(object_asset)
@@ -351,16 +373,25 @@ class DexTrackSharpa(VecTask):
         if len(env_ids) > 0:
             self.reset_idx(env_ids)
 
-        # Reference target for next frame
-        t_next = torch.clamp(self.progress_buf + 1, max=self.traj.T - 1)
-        ref_dof = self.traj.dof_pos[t_next]                    # (N, 29)
+        # ── DexTrack accumulating residual (paper L12219-12225) ────────────
+        # delta_delta_targets = speed_scale × dt × action × 2 × ctlFreqInv
+        # cur_delta_targets_warm += delta_delta_targets
+        # target = ref + cur_delta_targets_warm
+        delta_delta = (self.dof_speed_scale_tsr.unsqueeze(0)
+                        * self.sim_dt * actions * 2.0 * self.control_freq_inv)
+        self.cur_delta_targets_warm[:] = self.cur_delta_targets_warm + delta_delta
 
-        target = ref_dof + self.action_scale * actions
+        # Reference (kinematic bias) target for next frame
+        t_next   = torch.clamp(self.progress_buf + 1, max=self.traj.T - 1)
+        ref_dof  = self.traj.dof_pos[t_next]                   # (N, 29)
+        target   = ref_dof + self.cur_delta_targets_warm
+
         # Clip to joint limits
         target = torch.max(torch.min(target, self.robot_dof_upper), self.robot_dof_lower)
-        # Action moving average smoothing
+        # Optional action moving-average smoothing
         if self.action_moving_avg < 1.0:
-            target = self.action_moving_avg * target + (1.0 - self.action_moving_avg) * self.prev_targets
+            target = (self.action_moving_avg * target
+                      + (1.0 - self.action_moving_avg) * self.prev_targets)
         self.cur_targets[:] = target
         self.prev_targets[:] = target
 
@@ -452,6 +483,9 @@ class DexTrackSharpa(VecTask):
         self.reset_buf[env_ids]    = 0
         self.successes[env_ids]    = 0
         self.last_reward[env_ids]  = 0
+        # Reset accumulating residual (paper resets cur_delta_targets_warm per episode)
+        self.cur_delta_targets_warm[env_ids] = 0
+        self.prev_dof_vel[env_ids] = 0
 
     # =======================================================================
     # Reward + termination

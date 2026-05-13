@@ -14,11 +14,18 @@ env:
   clampAbsObservations: 50.0
   controlFrequencyInv: 1                    # 60 Hz
 
-  # --- Residual policy control mode ---
-  # action = clip(net_output, [-1, 1])
-  # target = traj.dof_pos[t+1] + actionScale * action
-  actionScale: 0.1
-  actionMovingAverage: 1.0                  # 1.0 disables smoothing; 0.1 = strong smoothing
+  # --- Residual policy control mode (DexTrack `use_kinematics_bias_wdelta=True`) ---
+  # DexTrack formula (allegro_hand_tracking_generalist.py L12198, L12219):
+  #   delta_delta_targets = speed_scale_per_joint × dt × action × 2 × ctlFreqInv
+  #   cur_delta_targets_warm += delta_delta_targets           (ACCUMULATING)
+  #   target = ref + cur_delta_targets_warm
+  # speed_scale_per_joint (wfranka, L1388):
+  #   arm 7-DOF : dofSpeedScale × franka_delta_delta_mult_coef = 20 × 2 = 40
+  #   hand 22-DOF: dofSpeedScale = 20
+  # Hand `frankaDeltaDeltaMultCoef` last assignment in run_tracking_*_wfranka.sh:1658 = 2.0.
+  dofSpeedScale:            20.0
+  frankaDeltaDeltaMultCoef: 2.0
+  actionMovingAverage:      1.0             # 1.0 disables smoothing
 
   # --- Reset behaviour ---
   # DexTrack `random_time` (one-shot scattering on the first reset only — all
@@ -67,11 +74,15 @@ env:
       failed_execute_progress_threshold: 20
       scale_factor: 1.0                     # 1.0 = paper thresholds verbatim
 
-  # --- Robot PD gains (Franka + Sharpa) ---
+  # --- Robot PD gains (DexTrack defaults, allegro_hand_tracking_generalist.py) ---
+  #   arm_stiffness = 400.0   (L521 default)
+  #   arm_damping   = 80.0    (L523 default)
+  #   stiffness_coef = 100.0  (L443; applied to hand DOFs in customize_damping path)
+  #   damping_coef   = 4.0    (L444)
   armStiffness:  400.0
-  armDamping:    40.0
-  handStiffness: 20.0
-  handDamping:   2.0
+  armDamping:    80.0
+  handStiffness: 100.0
+  handDamping:   4.0
 
   # --- Trajectory ---
   trajectory:
@@ -79,10 +90,14 @@ env:
     npy_path: "${oc.env:VIDEO_RL_FOLLOWER_ROOT,/home/intel/Codes/video-rl-follower}/data/sharpa_retarget_dextrack/s2_cubesmall_inspect_1_joint29_replay.npy"
     dt: ${eval:"1.0/60.0"}
 
-  # --- Object (cubesmall ≈ 5cm, 180g) ---
+  # --- Object (DexTrack wfranka rigid_obj_density=500, AllegroHandTrackingGeneralist.yaml L471) ---
+  # density × volume = mass.  For cubesmall (5cm cube, vol=1.25e-4 m³):
+  #   mass = 500 × 1.25e-4 = 0.0625 kg
+  # NOTE: this overrides any explicit mass set elsewhere — DexTrack derives
+  # mass from density × VHACD mesh volume rather than supplying it directly.
   object:
     size:     [0.05, 0.05, 0.05]
-    mass:     0.18
+    density:  500                            # DexTrack rigid_obj_density default
     friction: 1.0
 
   # --- Table (DexTrack wfranka geometry) ---
