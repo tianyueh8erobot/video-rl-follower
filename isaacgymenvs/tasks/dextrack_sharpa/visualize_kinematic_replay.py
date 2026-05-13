@@ -98,14 +98,13 @@ env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_P,     "play")
 def set_kinematic_frame(t: int):
     """Force the entire scene (robot DOFs + object root) to trajectory frame t.
 
-    Why this is non-trivial: simulate() must be called for IsaacGym to push
-    the state into the renderer, but simulate() also advances physics by dt.
-    To make that physics step a no-op:
-      • sim gravity is zeroed at cfg time (object can't fall mid-frame)
-      • PD targets are set EQUAL to the desired dof_pos, so PD applies no
-        torque (otherwise the hand drifts toward its last cur_targets, which
-        is often zero, producing a twisted/curled gesture)
-      • object linear/angular velocities are zeroed
+    KEY INSIGHT: do NOT call `gym.simulate()` per frame — it advances physics
+    by dt, which causes:
+      • the object to rotate from finger-contact reaction forces
+      • integration drift in the robot DOFs
+      • PD oscillations even with target = ref_dof
+    Instead we call simulate() ONCE at startup to initialise the render
+    pipeline, then every frame use `step_graphics + draw_viewer` only.
     """
     t = max(0, min(t, env.traj.T - 1))
     ref_dof = env.traj.dof_pos[t]                                 # (29,)
@@ -117,9 +116,8 @@ def set_kinematic_frame(t: int):
         gymtorch.unwrap_tensor(env.dof_state.view(-1, 2)),
         gymtorch.unwrap_tensor(env.robot_actor_idx_global[:1].contiguous()), 1)
 
-    # 2) PD targets MUST match dof_pos — otherwise the PD controller drives
-    #    the hand toward stale cur_targets (often zero pose → twisted hand)
-    #    in the 1/60 s that simulate() steps before our next overwrite.
+    # 2) PD targets in sync — harmless even without simulate(), and stays
+    #    safe if user holds frame for >1 step (or simulate is invoked again).
     env.cur_targets[0, :]  = ref_dof
     env.prev_targets[0, :] = ref_dof
     env.gym.set_dof_position_target_tensor(env.sim,
@@ -134,13 +132,22 @@ def set_kinematic_frame(t: int):
         gymtorch.unwrap_tensor(env.root_states),
         gymtorch.unwrap_tensor(env.object_actor_idx_global[:1].contiguous()), 1)
 
-    # 4) simulate() — propagates writes to renderer.  With g=0 + PD targets
-    #    matching dof_pos + obj vel = 0, this step is physically a no-op.
-    env.gym.simulate(env.sim)
-    env.gym.fetch_results(env.sim, True)
+    # 4) Refresh gym-side tensors so the renderer reads our writes.
+    #    NO simulate() — that would advance physics and re-introduce the
+    #    contact-spin / PD-twist artifacts.
     env.gym.refresh_actor_root_state_tensor(env.sim)
     env.gym.refresh_dof_state_tensor(env.sim)
     env.gym.refresh_rigid_body_state_tensor(env.sim)
+
+
+# ── Warm the render pipeline ONCE before the main loop.  Without this very
+#    first simulate(), the viewer shows only the initial-spawn scene (table)
+#    even after our state writes — the GPU side of IsaacGym hasn't built up
+#    its visual buffers yet.
+set_kinematic_frame(0)
+env.gym.simulate(env.sim)
+env.gym.fetch_results(env.sim, True)
+set_kinematic_frame(0)        # re-write after the one allowed simulate
 
 
 t = 0
