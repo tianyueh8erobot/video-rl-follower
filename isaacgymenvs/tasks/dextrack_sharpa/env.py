@@ -106,10 +106,13 @@ class DexTrackSharpa(VecTask):
         self.table_friction = table_cfg.get("friction", 1.0)
 
         # PD gains (Franka panda + Sharpa) — same defaults as SimToolReal class.
+        # DexTrack defaults (allegro_hand_tracking_generalist.py):
+        #   arm_stiffness=400 / arm_damping=80         (L521/L523)
+        #   stiffness_coef=100 / damping_coef=4        (L443/L444, applied to hand DOFs)
         self.arm_stiffness   = env_cfg.get("armStiffness",   400.0)
-        self.arm_damping     = env_cfg.get("armDamping",     40.0)
-        self.hand_stiffness  = env_cfg.get("handStiffness",  20.0)
-        self.hand_damping    = env_cfg.get("handDamping",    2.0)
+        self.arm_damping     = env_cfg.get("armDamping",     80.0)
+        self.hand_stiffness  = env_cfg.get("handStiffness",  100.0)
+        self.hand_damping    = env_cfg.get("handDamping",    4.0)
 
         # ---- obs / state dims ----
         future_frames = (FUTURE_FRAMES_MANIPTRANS if self.reward_style == "maniptrans"
