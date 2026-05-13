@@ -106,6 +106,12 @@ def set_kinematic_frame(t: int):
     env.gym.set_actor_root_state_tensor_indexed(env.sim,
         gymtorch.unwrap_tensor(env.root_states),
         gymtorch.unwrap_tensor(env.object_actor_idx_global[:1].contiguous()), 1)
+    # CRITICAL: after writing tensors, must call simulate + fetch_results so
+    # IsaacGym propagates the new state into the rendering pipeline.  Without
+    # this the viewer shows whatever scene existed before the writes (only
+    # the table, since that was placed at env construction).
+    env.gym.simulate(env.sim)
+    env.gym.fetch_results(env.sim, True)
     env.gym.refresh_actor_root_state_tensor(env.sim)
     env.gym.refresh_dof_state_tensor(env.sim)
     env.gym.refresh_rigid_body_state_tensor(env.sim)
