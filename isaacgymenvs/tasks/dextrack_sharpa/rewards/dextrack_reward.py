@@ -75,7 +75,21 @@ def compute_dextrack_reward(
     success_obj_pos_thresh: float = 0.05, # 5cm
     success_obj_rot_thresh: float = 5.0 / 180.0 * math.pi,  # 5°
     reach_goal_bonus: float = 0.0,
-    early_terminate_obj_dist: float = 0.0,  # 0 disables; DexTrack uses 0.2m drift
+    early_terminate_obj_dist: float = 0.2,  # DexTrack default; 0 to disable
+    # target_flag sanity bounds (DexTrack L12762):
+    #   (|Δhand_pos|_1 ≤ 0.4) AND (|Δhand_rot|_1 ≤ 1.0) AND (|Δhand_qpos|_1 ≤ 6.0)
+    target_flag_pos_thresh:    float = 0.4,
+    target_flag_rot_thresh:    float = 1.0,
+    target_flag_qpos_thresh:   float = 6.0,
+    # hand_up term (DexTrack L12811-12832): when object is lifted, reward
+    # further lifting actions.  Thresholds are object-frame z-heights:
+    hand_up_thresh_1: float = 0.18,   # ≥ this → small positive shaping (×actions[:, 2])
+    hand_up_thresh_2: float = 0.20,   # ≥ this → larger flat reward
+    hand_up_action_idx: int = 0,      # DexTrack uses actions[:,2] for shadow-hand wrist-z;
+                                       # for our 29-DOF Franka+Sharpa we expose this as cfg knob.
+    # Smoothness reward (DexTrack L12780).  Default coef=0 matches DexTrack
+    # default (the smoothness path is opt-in).
+    smoothness_coef: float = 0.0,
 ) -> Tuple[Tensor, Tensor, Tensor, Dict[str, Tensor]]:
     """Return (reward, failed_execute, succeeded, components).
 
@@ -100,6 +114,15 @@ def compute_dextrack_reward(
                    + glb_rot_coef * d_wrist_rot
                    + fingerpose_coef * d_fingerpose)
     r_hand_guidance = -delta_hand_pose_coef * delta_value
+
+    # ─── target_flag (DexTrack L12762) ───────────────────────────────────────
+    # Sanity-check that the *commanded delta* is within reasonable bounds.
+    # We approximate the paper's delta_qpos with the state-to-ref diff
+    # components above (d_wrist_trans / d_wrist_rot / d_fingerpose).
+    target_flag = ((d_wrist_trans <= target_flag_pos_thresh).int()
+                    + (d_wrist_rot   <= target_flag_rot_thresh).int()
+                    + (d_fingerpose  <= target_flag_qpos_thresh).int())
+    target_flag_ok = (target_flag == 3)                 # all 3 sanity bounds met
 
     # ─── Finger / wrist distances to object ─────────────────────────────────
     # DexTrack uses 4 fingers (thumb / index / middle / ring); pinky commented
@@ -126,13 +149,41 @@ def compute_dextrack_reward(
 
     inhand_rew = (obj_pos_coef * (0.9 - 2.0 * d_obj_pos)
                   + obj_rot_coef * (math.pi - d_obj_rot))
-    # DexTrack `flag = finger_close + wrist_close + target_flag` (==3 for our
-    # always-on target_flag); we use 2-of-2 (finger+wrist close) since we
-    # don't carry the L1 sanity-check flag from DexTrack.
-    contact_flag = ((d_tip_obj <= 0.12 * len(fingertip_idxs))
-                     & (d_wrist_obj <= 0.12))
+    # DexTrack `flag = finger_close + wrist_close + target_flag` == 5 ⇒ all
+    # three sub-flags (target_flag yields +3, finger +1, wrist +1) = 5.
+    # In our simplified booleans the 3-of-3 gate is equivalent.
+    finger_close = (d_tip_obj  <= 0.12 * len(fingertip_idxs))
+    wrist_close  = (d_wrist_obj <= 0.12)
+    contact_flag = finger_close & wrist_close & target_flag_ok
     goal_hand_rew = torch.where(contact_flag, inhand_rew,
                                  torch.zeros_like(inhand_rew))
+
+    # ─── Hand-up term (DexTrack L12830-12832) ───────────────────────────────
+    # When the object has been lifted off the table (`lowest >= lift_z`),
+    # reward additional upward action — encourages the policy to keep lifting.
+    # The paper uses object_pos[:, 2] as `lowest` and a per-trajectory
+    # `lift_z = object_init_z + (hand_up_thresh_1 - 0.030) + 0.003`.  We use
+    # the reference (target) obj_pos at frame 0 as init_z proxy.
+    obj_z = state["obj_pos"][:, 2]
+    init_z = target["obj_pos"][:, 2] - (target["obj_pos"][:, 2] - obj_z).detach() * 0.0  # init_z ≈ obj_init_z
+    # Simpler: use obj_z relative to the trajectory's initial height (passed in
+    # via a buffer would be cleaner; for now use absolute hand_up_thresh).
+    lift_flag_1 = obj_z >= hand_up_thresh_1
+    lift_flag_2 = obj_z >= hand_up_thresh_2
+    grip_flag   = finger_close & wrist_close                          # `flag2 == 2`
+    # action[:, hand_up_action_idx] is the wrist-z residual action component.
+    action_z = actions[:, hand_up_action_idx]
+    hand_up = torch.zeros_like(obj_z)
+    hand_up = torch.where(lift_flag_1 & grip_flag,
+                          0.1 + 0.1 * action_z, hand_up)
+    hand_up = torch.where(lift_flag_2 & grip_flag,
+                          torch.full_like(obj_z, 0.2), hand_up)
+
+    # ─── Smoothness reward (DexTrack L12780, opt-in via coef) ──────────────
+    r_smoothness = torch.zeros(N, device=device)
+    if smoothness_coef > 0 and "prev_dof_vel" in state:
+        r_smoothness = -smoothness_coef * torch.norm(
+            state["prev_dof_vel"] - state["dof_vel"], p=2, dim=-1)
 
     # ─── Success bonus (DexTrack `bonus`) ──────────────────────────────────
     success_pos = d_obj_pos < success_obj_pos_thresh
@@ -147,7 +198,8 @@ def compute_dextrack_reward(
     bonus = bonus + reach_goal_bonus * succeeded.float()
 
     # ─── Total ─────────────────────────────────────────────────────────────
-    reward = r_hand_guidance + r_finger_obj + goal_hand_rew + bonus
+    reward = (r_hand_guidance + r_finger_obj + goal_hand_rew
+              + hand_up + r_smoothness + bonus)
 
     # ─── Early termination on object loss (DexTrack `early_terminate`) ────
     if early_terminate_obj_dist > 0:
@@ -161,6 +213,8 @@ def compute_dextrack_reward(
         "r_hand_guidance": r_hand_guidance,
         "r_finger_obj":    r_finger_obj,
         "r_goal_hand":     goal_hand_rew,
+        "r_hand_up":       hand_up,
+        "r_smoothness":    r_smoothness,
         "r_bonus":         bonus,
         "delta_value":     delta_value,
         "d_obj_pos":       d_obj_pos,
