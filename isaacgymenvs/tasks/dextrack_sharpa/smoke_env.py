@@ -9,7 +9,10 @@ from isaacgymenvs.tasks.dextrack_sharpa.env import DexTrackSharpa
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = "/home/intel/Codes/video-rl-follower"
+ROOT = os.environ.get(
+    "VIDEO_RL_FOLLOWER_ROOT",
+    os.path.abspath(os.path.join(HERE, "..", "..", "..")),
+)
 
 
 def main(reward_style: str = "dextrack"):
