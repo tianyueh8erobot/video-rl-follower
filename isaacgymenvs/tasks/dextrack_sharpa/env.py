@@ -121,17 +121,23 @@ class DexTrackSharpa(VecTask):
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
         dof_state        = self.gym.acquire_dof_state_tensor(self.sim)
         rigid_body_state = self.gym.acquire_rigid_body_state_tensor(self.sim)
+        dof_force_state  = self.gym.acquire_dof_force_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_dof_force_tensor(self.sim)
 
         self.root_states     = gymtorch.wrap_tensor(actor_root_state)        # (n_actors_total, 13)
         self.dof_state       = gymtorch.wrap_tensor(dof_state).view(self.num_envs, NUM_DOFS, 2)
         self.rigid_body_state = gymtorch.wrap_tensor(rigid_body_state).view(
             self.num_envs, self.num_rigid_bodies_per_env, 13)
+        self.dof_force       = gymtorch.wrap_tensor(dof_force_state).view(self.num_envs, NUM_DOFS)
 
         self.arm_hand_dof_pos = self.dof_state[..., 0]
         self.arm_hand_dof_vel = self.dof_state[..., 1]
+        # Track previous-step dof_vel for the DexTrack smoothness reward term
+        # (smoothness_rew = -coef × |prev_dof_vel - cur_dof_vel|, paper L12780).
+        self.prev_dof_vel = torch.zeros_like(self.arm_hand_dof_vel)
 
         # Per-env actor indices (robot + object + table)
         self.robot_actor_idx_global   = torch.tensor(self.robot_actor_idx_global_list,
@@ -276,6 +282,10 @@ class DexTrackSharpa(VecTask):
             robot_actor = self.gym.create_actor(env, robot_asset, robot_pose,
                                                  "robot", i, 0, 0)
             self.gym.set_actor_dof_properties(env, robot_actor, robot_dof_props)
+            # Enable DOF force sensors so we can later read per-DOF joint torques
+            # via acquire_dof_force_tensor (needed for ManipTrans r_power that
+            # uses |dof_force × dof_vel| — paper dexhandimitator.py L579).
+            self.gym.enable_actor_dof_force_sensors(env, robot_actor)
             self.robot_actor_idx_global_list.append(
                 self.gym.get_actor_index(env, robot_actor, gymapi.DOMAIN_SIM))
 
@@ -347,10 +357,15 @@ class DexTrackSharpa(VecTask):
 
     def post_physics_step(self):
         """Refresh sim, compute reward & obs, increment progress."""
+        # Cache last-step dof_vel BEFORE refreshing — smoothness reward uses
+        # |prev_dof_vel - cur_dof_vel|.
+        self.prev_dof_vel[:] = self.arm_hand_dof_vel
+
         self.progress_buf += 1
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_dof_force_tensor(self.sim)
 
         self._compute_reward_and_termination()
         self._compute_obs()
@@ -440,6 +455,8 @@ class DexTrackSharpa(VecTask):
         return {
             "dof_pos":       self.arm_hand_dof_pos,
             "dof_vel":       self.arm_hand_dof_vel,
+            "dof_force":     self.dof_force,
+            "prev_dof_vel":  self.prev_dof_vel,
             "wrist_pos":     wrist[:, 0:3],
             "wrist_quat":    wrist[:, 3:7],
             "wrist_vel":     wrist[:, 7:10],

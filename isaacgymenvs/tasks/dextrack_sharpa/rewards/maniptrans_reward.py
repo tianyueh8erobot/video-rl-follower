@@ -114,10 +114,22 @@ def compute_maniptrans_reward(
 
     reward_joints_vel = torch.exp(-1.0 * diff_links_vel.mean(-1))
 
-    # --- Power penalties (effort × velocity), from current state ---
-    # power ≈ (dof_vel² mean), wrist_power ≈ wrist_vel norm² + ang_vel norm²
-    power       = state["dof_vel"][:, 7:].pow(2).mean(-1)            # Sharpa joints
-    wrist_power = state["wrist_vel"].norm(dim=-1).pow(2) + state["wrist_ang_vel"].norm(dim=-1).pow(2)
+    # --- Power penalties (real effort × velocity, paper-faithful) ---
+    # Paper formula (dexhandimitator.py L579-589):
+    #   power       = |dof_force × dof_vel|.sum()                   (all DOFs)
+    #   wrist_power = |F_lin · v_lin| + |F_ang · v_ang|             (wrist body)
+    # F_lin / F_ang are the EXTERNAL forces applied to the wrist body
+    # (`apply_forces[wrist]`).  We don't apply external perturbation forces in
+    # our setup, so wrist_power is effectively 0 → reward_wrist_power saturates
+    # at exp(0)=1.  This matches DexTrack/ManipTrans tracking eval where no
+    # random perturbations are active either.  If you turn on apply_forces in
+    # future, plumb them in here.
+    if "dof_force" in state:
+        power = torch.abs(state["dof_force"] * state["dof_vel"]).sum(dim=-1)
+    else:
+        # Fallback for callers that haven't wired dof_force yet (e.g. unit tests).
+        power = torch.zeros(N, device=device)
+    wrist_power = torch.zeros(N, device=device)
     reward_power       = torch.exp(-10.0 * power)
     reward_wrist_power = torch.exp(- 2.0 * wrist_power)
 
