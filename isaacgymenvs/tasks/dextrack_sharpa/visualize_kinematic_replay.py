@@ -93,6 +93,23 @@ env = DexTrackSharpa(cfg=OmegaConf.to_container(cfg, resolve=True),
 print(f"[viz-kinematic] T={env.traj.T}  obj_init z={env.traj.obj_pos[0,2].item():.3f}")
 print("[viz-kinematic] keys: SPACE=step  R=reset  P=auto-play  ESC=quit\n")
 
+# ── Disable cube↔robot contact in viz mode ──────────────────────────────
+# IsaacGym semantics: shapes whose `filter` masks share ANY bit do NOT
+# collide.  Without this, even with gravity=0 and zero velocity, every
+# simulate() runs the contact solver and finger-cube interpenetration
+# (1-5mm of normal retargeting noise) sends the cube spinning.  PyBullet
+# avoids this by using baseMass=0 (kinematic body) and not calling
+# stepSimulation at all — IsaacGym has no kinematic-body API, but the
+# collision filter achieves the same effect during replay.
+NO_COLLIDE_BIT = 1 << 30
+for actor_name in ("object", "robot"):
+    h = env.gym.find_actor_handle(env.envs[0], actor_name)
+    props = env.gym.get_actor_rigid_shape_properties(env.envs[0], h)
+    for p in props:
+        p.filter = int(p.filter) | NO_COLLIDE_BIT
+    env.gym.set_actor_rigid_shape_properties(env.envs[0], h, props)
+print(f"[viz-kinematic] cube↔robot contact disabled via filter bit {NO_COLLIDE_BIT:#x}")
+
 cam_pos    = gymapi.Vec3(+0.10, -0.70, +0.95)
 cam_target = gymapi.Vec3(+0.45, -0.05, +0.55)
 env.gym.viewer_camera_look_at(env.viewer, env.envs[0], cam_pos, cam_target)

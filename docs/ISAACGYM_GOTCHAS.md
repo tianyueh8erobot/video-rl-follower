@@ -101,7 +101,48 @@ Reference: `isaacgymenvs/tasks/dextrack_sharpa/visualize_kinematic_replay.py`
 and ManipTrans `DexManipNet/dexmanip_sh.py::play()` (same pattern).
 
 
-## 3. Diagnostic helpers for future trips into this swamp
+## 3. IsaacGym has no "kinematic body" — disable contact for replay
+
+PyBullet's `createMultiBody(baseMass=0.0, ...)` makes a true kinematic
+body that ignores physics forces.  Combined with `setGravity(0,0,0)` and
+**never calling `stepSimulation()`**, you can `resetBasePositionAndOrientation`
+every frame and the renderer shows exactly that pose.  This is how
+`pybullet_replay.py` produces clean trajectory videos.
+
+IsaacGym has no equivalent flag.  Any actor with finite density is a
+dynamic body, and `simulate()` (which we MUST call per §2) runs the
+contact solver every frame.  Retargeted finger grasps typically have
+1-5 mm of interpenetration with the object, and the contact solver
+turns that into a large reaction impulse — within one dt=1/60 s the
+cube can rotate >40°.  Same `set_actor_root_state` written next frame
+gets overwritten by physics again, so visually the cube wobbles
+continuously.
+
+**Fix for replay: disable cube↔robot collision via filter bit.**
+IsaacGym's per-shape `filter` is a 32-bit mask; if two shapes share
+ANY bit, the contact solver skips that pair.
+
+```python
+NO_COLLIDE_BIT = 1 << 30     # stay within signed int32 range
+for actor_name in ("object", "robot"):
+    h = gym.find_actor_handle(env_ptr, actor_name)
+    props = gym.get_actor_rigid_shape_properties(env_ptr, h)
+    for p in props:
+        p.filter = int(p.filter) | NO_COLLIDE_BIT
+    gym.set_actor_rigid_shape_properties(env_ptr, h, props)
+```
+
+Verified with `diag_no_contact.py`: max obj-quat drift drops from
+0.7526 (contact on) → **0.0000** (contact off) across the full 300-frame
+replay.  Cube↔table contact is preserved (table.filter still 0).
+
+**Do NOT do this in training.**  This trick is replay-only — the policy
+needs real finger-object contact for grasping.  Training-time
+trajectory bursts (e.g. small retargeting overlaps causing a brief
+contact spike at frame 0) are handled instead by the `randomTime`
+scattering and PD smoothing in `pre_physics_step`.
+
+## 4. Diagnostic helpers for future trips into this swamp
 
 Located under `isaacgymenvs/tasks/dextrack_sharpa/`, but the principles
 generalise to any IsaacGym task:
