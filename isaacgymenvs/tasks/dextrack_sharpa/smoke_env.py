@@ -30,7 +30,7 @@ def main(reward_style: str = "dextrack"):
             "reward_style":        reward_style,
             "randomTime":          False,           # smoke uses frame-0 only (toggle to True to exercise scatter)
             "reward": {
-                "dextrack":   {"reach_goal_bonus": 0.0},
+                "dextrack":   {"early_terminate_obj_dist": 0.0},   # disable early-term for smoke
                 "maniptrans": {"failed_execute_enabled": False},   # no early termination
             },
             "armStiffness":  400.0,
