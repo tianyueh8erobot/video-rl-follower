@@ -142,33 +142,42 @@ trajectory bursts (e.g. small retargeting overlaps causing a brief
 contact spike at frame 0) are handled instead by the `randomTime`
 scattering and PD smoothing in `pre_physics_step`.
 
-## 4. DexTrack-shipped LEAP `object_rot_quat` is inverted vs GRAB
+## 4. DexTrack-shipped LEAP `object_rot_quat` differs from GRAB by 180°
+    around X — but it's visually equivalent for a symmetric object
 
-(Not strictly an IsaacGym pitfall, but the bug surfaced during a sanity
-check against the LEAP reference and is worth recording so future devs
-don't conclude "our data is broken" by comparing to LEAP.)
+When comparing our retargeted `object_rot_quat` against the LEAP
+reference, the two quaternions disagree by 180° about the world x-axis
+for `s2_cubesmall_inspect_1`:
 
-For `s2_cubesmall_inspect_1`:
+| Source | Δ vs GRAB rotation |
+|---|---|
+| GRAB original `obj.params.global_orient` (axis-angle, `|aa|=4.70 rad`) | 0° (reference) |
+| Our packed `object_rot_quat` (scipy `R.from_rotvec(aa).as_quat()` → xyzw) | **0.08°** (float32 rounding only) |
+| `leap_passive_active_info_*_nf_300.npy::object_rot_quat` | **179°** (around x) |
 
-| Source | Conversion | Δ vs GRAB rotation |
-|---|---|---|
-| GRAB original `obj.params.global_orient` (axis-angle, `|aa|=4.70 rad`) | — | 0° (reference) |
-| Our packed `object_rot_quat` (scipy `R.from_rotvec(aa).as_quat()` → xyzw) | direct | **0.08°** (float32 rounding only) |
-| `leap_passive_active_info_*_nf_300.npy::object_rot_quat` | DexTrack-shipped | **179°** |
+**However**, the GRAB cubesmall is a 5 cm cube whose six faces are
+geometrically indistinguishable, so the 180°-around-x difference is
+*invisible* — a hybrid replay (`render_hybrid_montage.py`) where
+the cube is rendered at `obj_pos = OURS` but `obj_quat = LEAP_shipped`
+is pixel-for-pixel identical to the canonical replay.  Both quaternion
+conventions are self-consistent: each retargeter fit its hand mocap
+against the reference frame it was using.
 
-LEAP's quat has the right `xyz` signs and the **wrong `w` sign**.
-Reproducible by wrapping `|aa| > π` to `2π − |aa|` without flipping the
-axis sign — a classic quat-conversion bug.  Invisible in LEAP replay
-videos because the GRAB cubesmall is a symmetric 5 cm box and the
-fingertip retargeting was fit with the inverted reference, so contacts
-still land on cube faces.  If you ever try to use LEAP's quat directly
-on a non-symmetric object you'll get a 180°-off pose.
+Implications:
+- **For training**: both are equally valid.  The policy learns to
+  track whatever the env writes; symmetric-object orientation is moot.
+- **For non-symmetric objects (apple, mug, mouse, ...)**: the same 180°
+  divergence would be immediately visible as a flipped pose.  If you
+  ever swap our retargeter against LEAP-shipped data on a marked
+  object, double-check that the convention matches end-to-end.
+- **For our env**: `set_actor_root_state_tensor_indexed` writes xyzw,
+  IsaacGym reads xyzw — no transformation in our env code.
+  `traj.obj_quat == GRAB.global_orient.as_quat()` end-to-end.  We
+  preserved the GRAB convention exactly.
 
-Verification: `isaacgymenvs/tasks/dextrack_sharpa/diag_obj_quat_provenance.py`.
-
-Implication for our env: `set_actor_root_state_tensor_indexed` writes
-xyzw, IsaacGym reads xyzw — no transformation in our env code.
-`traj.obj_quat == GRAB.global_orient.as_quat()` end-to-end.
+Reproducer: `isaacgymenvs/tasks/dextrack_sharpa/diag_obj_quat_provenance.py`.
+Visual check: `render_hybrid_montage.py` (compares two cube-pose
+conventions side-by-side in the same Sharpa env).
 
 ## 5. Diagnostic helpers for future trips into this swamp
 
