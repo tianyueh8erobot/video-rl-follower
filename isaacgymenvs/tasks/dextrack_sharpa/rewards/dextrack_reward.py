@@ -158,20 +158,26 @@ def compute_dextrack_reward(
     goal_hand_rew = torch.where(contact_flag, inhand_rew,
                                  torch.zeros_like(inhand_rew))
 
-    # ─── Hand-up term (DexTrack L12830-12832) ───────────────────────────────
-    # When the object has been lifted off the table (`lowest >= lift_z`),
-    # reward additional upward action — encourages the policy to keep lifting.
-    # The paper uses object_pos[:, 2] as `lowest` and a per-trajectory
-    # `lift_z = object_init_z + (hand_up_thresh_1 - 0.030) + 0.003`.  We use
-    # the reference (target) obj_pos at frame 0 as init_z proxy.
+    # ─── Hand-up term (DexTrack L12808-12832) ───────────────────────────────
+    # Paper: lift_z = object_init_z + (hand_up_threshold_1 - 0.030) + 0.003.
+    # We compare against the **object's initial height** (state["obj_init_z"],
+    # populated by env from traj.obj_pos[0, 2]) instead of an absolute number,
+    # so the term is correctly disabled when the object is still on the table.
     obj_z = state["obj_pos"][:, 2]
-    init_z = target["obj_pos"][:, 2] - (target["obj_pos"][:, 2] - obj_z).detach() * 0.0  # init_z ≈ obj_init_z
-    # Simpler: use obj_z relative to the trajectory's initial height (passed in
-    # via a buffer would be cleaner; for now use absolute hand_up_thresh).
-    lift_flag_1 = obj_z >= hand_up_thresh_1
-    lift_flag_2 = obj_z >= hand_up_thresh_2
+    if "obj_init_z" in state:
+        lift_z_1 = state["obj_init_z"] + (hand_up_thresh_1 - 0.030) + 0.003
+        lift_z_2 = state["obj_init_z"] + (hand_up_thresh_2 - 0.030) + 0.003
+    else:
+        lift_z_1 = torch.full_like(obj_z, hand_up_thresh_1)
+        lift_z_2 = torch.full_like(obj_z, hand_up_thresh_2)
+    lift_flag_1 = obj_z >= lift_z_1
+    lift_flag_2 = obj_z >= lift_z_2
     grip_flag   = finger_close & wrist_close                          # `flag2 == 2`
     # action[:, hand_up_action_idx] is the wrist-z residual action component.
+    # For Shadow Hand (paper) index 2 = wrist linear-z; for our 29-DOF
+    # Franka+Sharpa this index is per-cfg (no clean single-joint mapping —
+    # leave the term opt-in by tuning via cfg or set coef in the env reward
+    # call to 0 to disable).
     action_z = actions[:, hand_up_action_idx]
     hand_up = torch.zeros_like(obj_z)
     hand_up = torch.where(lift_flag_1 & grip_flag,

@@ -170,6 +170,10 @@ class DexTrackSharpa(VecTask):
         self.all_hand_body_idxs = torch.tensor([
             self.robot_body_name_to_idx[n] for n in SHARPA_BODY_NAMES
         ], dtype=torch.long, device=self.device)
+        # Per-env object initial-frame z (= obj_pos[0, 2] from the trajectory).
+        # Used by the DexTrack hand_up reward term (paper L12810-12811
+        # `lift_z = object_init_z + (hand_up_thresh_1 - 0.030) + 0.003`).
+        self.obj_init_z = self.traj.obj_pos[0, 2].expand(self.num_envs).clone()
 
         # Initial reset to ref-frame 0 for every env
         self.reset_buf[:] = 1
@@ -467,6 +471,7 @@ class DexTrackSharpa(VecTask):
             "obj_quat":      obj_root[:, 3:7],
             "obj_lin_vel":   obj_root[:, 7:10],
             "obj_ang_vel":   obj_root[:, 10:13],
+            "obj_init_z":    self.obj_init_z,
         }
 
     def _compute_reward_and_termination(self):
