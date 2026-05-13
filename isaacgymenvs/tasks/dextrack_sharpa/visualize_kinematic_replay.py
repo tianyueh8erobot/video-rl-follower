@@ -53,8 +53,14 @@ cfg = OmegaConf.create({
         "enableCameraSensors": False,
     },
     "sim": {
+        # ZERO gravity — this script writes DOF + obj state every frame; we
+        # must call simulate() to propagate to the renderer, and simulate()
+        # advances physics 1/60 s.  With gravity on, the object falls and
+        # wobbles between frames; with PD targets out of sync, the hand
+        # twists toward zero pose.  Zero gravity + synced PD targets makes
+        # simulate() a no-op for state but still triggers render updates.
         "dt": 1.0/60.0, "substeps": 2, "up_axis": "z",
-        "use_gpu_pipeline": True, "gravity": [0.0, 0.0, -9.81],
+        "use_gpu_pipeline": True, "gravity": [0.0, 0.0, 0.0],
         "physx": {
             "num_threads": 4, "solver_type": 1, "use_gpu": True,
             "num_position_iterations": 8, "num_velocity_iterations": 0,
@@ -90,15 +96,36 @@ env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_P,     "play")
 
 
 def set_kinematic_frame(t: int):
-    """Direct write of dof_pos + object root state from trajectory, NO physics step."""
+    """Force the entire scene (robot DOFs + object root) to trajectory frame t.
+
+    Why this is non-trivial: simulate() must be called for IsaacGym to push
+    the state into the renderer, but simulate() also advances physics by dt.
+    To make that physics step a no-op:
+      • sim gravity is zeroed at cfg time (object can't fall mid-frame)
+      • PD targets are set EQUAL to the desired dof_pos, so PD applies no
+        torque (otherwise the hand drifts toward its last cur_targets, which
+        is often zero, producing a twisted/curled gesture)
+      • object linear/angular velocities are zeroed
+    """
     t = max(0, min(t, env.traj.T - 1))
-    # 1) DOFs
-    env.dof_state[0, :, 0] = env.traj.dof_pos[t]
+    ref_dof = env.traj.dof_pos[t]                                 # (29,)
+
+    # 1) DOF state (position + zero velocity)
+    env.dof_state[0, :, 0] = ref_dof
     env.dof_state[0, :, 1] = 0.0
     env.gym.set_dof_state_tensor_indexed(env.sim,
         gymtorch.unwrap_tensor(env.dof_state.view(-1, 2)),
         gymtorch.unwrap_tensor(env.robot_actor_idx_global[:1].contiguous()), 1)
-    # 2) Object root state
+
+    # 2) PD targets MUST match dof_pos — otherwise the PD controller drives
+    #    the hand toward stale cur_targets (often zero pose → twisted hand)
+    #    in the 1/60 s that simulate() steps before our next overwrite.
+    env.cur_targets[0, :]  = ref_dof
+    env.prev_targets[0, :] = ref_dof
+    env.gym.set_dof_position_target_tensor(env.sim,
+        gymtorch.unwrap_tensor(env.cur_targets))
+
+    # 3) Object root state (pos + orient + zero vel)
     obj_idx = env.object_actor_idx_global[:1].long()
     env.root_states[obj_idx, 0:3] = env.traj.obj_pos[t]
     env.root_states[obj_idx, 3:7] = env.traj.obj_quat[t]
@@ -106,10 +133,9 @@ def set_kinematic_frame(t: int):
     env.gym.set_actor_root_state_tensor_indexed(env.sim,
         gymtorch.unwrap_tensor(env.root_states),
         gymtorch.unwrap_tensor(env.object_actor_idx_global[:1].contiguous()), 1)
-    # CRITICAL: after writing tensors, must call simulate + fetch_results so
-    # IsaacGym propagates the new state into the rendering pipeline.  Without
-    # this the viewer shows whatever scene existed before the writes (only
-    # the table, since that was placed at env construction).
+
+    # 4) simulate() — propagates writes to renderer.  With g=0 + PD targets
+    #    matching dof_pos + obj vel = 0, this step is physically a no-op.
     env.gym.simulate(env.sim)
     env.gym.fetch_results(env.sim, True)
     env.gym.refresh_actor_root_state_tensor(env.sim)
