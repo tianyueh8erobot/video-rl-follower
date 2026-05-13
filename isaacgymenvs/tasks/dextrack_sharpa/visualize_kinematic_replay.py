@@ -1,6 +1,18 @@
 """Pure kinematic playback of the reference trajectory in the DexTrackSharpa env.
 Forces the robot DOFs + object root state to traj frame t every step.  NO policy.
 
+CONVENTION: object pose is rendered in the GRAB ground-truth orientation.
+The packed `object_rot_quat` comes from `R.from_rotvec(GRAB_axis_angle).as_quat()`
+(xyzw, R_obj→world).  We write it straight into IsaacGym's root-state slot
+(also xyzw, R_obj→world) — no transformation, full GRAB fidelity.
+
+The DexTrack-shipped LEAP retargeted npy stores the *inverse* rotation
+(R_world→obj); rendering it would show the cube going through the inverted
+trajectory.  Both conventions are self-consistent inside their own
+retargeter (LEAP's hand data is paired with the inverted cube), but only
+the GRAB-original convention matches the human mocap.  See
+`docs/ISAACGYM_GOTCHAS.md` §4 for the full story.
+
 Run:
   cd ~/Codes/video-rl-follower
   PYTHONPATH=. python isaacgymenvs/tasks/dextrack_sharpa/visualize_kinematic_replay.py

@@ -142,42 +142,76 @@ trajectory bursts (e.g. small retargeting overlaps causing a brief
 contact spike at frame 0) are handled instead by the `randomTime`
 scattering and PD smoothing in `pre_physics_step`.
 
-## 4. DexTrack-shipped LEAP `object_rot_quat` differs from GRAB by 180°
-    around X — but it's visually equivalent for a symmetric object
+## 4. DexTrack-shipped LEAP `object_rot_quat` stores the INVERSE rotation
+    of the GRAB ground truth
 
-When comparing our retargeted `object_rot_quat` against the LEAP
-reference, the two quaternions disagree by 180° about the world x-axis
-for `s2_cubesmall_inspect_1`:
+Comparing per-frame rotation matrices for `s2_cubesmall_inspect_1`:
 
-| Source | Δ vs GRAB rotation |
-|---|---|
-| GRAB original `obj.params.global_orient` (axis-angle, `|aa|=4.70 rad`) | 0° (reference) |
-| Our packed `object_rot_quat` (scipy `R.from_rotvec(aa).as_quat()` → xyzw) | **0.08°** (float32 rounding only) |
-| `leap_passive_active_info_*_nf_300.npy::object_rot_quat` | **179°** (around x) |
+```
+r_our[t] * r_leap[t]  =  identity     (max error 0.00° across all 300 frames)
+```
 
-**However**, the GRAB cubesmall is a 5 cm cube whose six faces are
-geometrically indistinguishable, so the 180°-around-x difference is
-*invisible* — a hybrid replay (`render_hybrid_montage.py`) where
-the cube is rendered at `obj_pos = OURS` but `obj_quat = LEAP_shipped`
-is pixel-for-pixel identical to the canonical replay.  Both quaternion
-conventions are self-consistent: each retargeter fit its hand mocap
-against the reference frame it was using.
+i.e. `R_leap[t] = R_our[t]⁻¹`.  Confirmed by direct inspection of the
+quat matrices: `R_leap` is exactly `R_our.transpose`, and for unit
+rotations `R.T == R.inv()`.
 
-Implications:
-- **For training**: both are equally valid.  The policy learns to
-  track whatever the env writes; symmetric-object orientation is moot.
-- **For non-symmetric objects (apple, mug, mouse, ...)**: the same 180°
-  divergence would be immediately visible as a flipped pose.  If you
-  ever swap our retargeter against LEAP-shipped data on a marked
-  object, double-check that the convention matches end-to-end.
-- **For our env**: `set_actor_root_state_tensor_indexed` writes xyzw,
-  IsaacGym reads xyzw — no transformation in our env code.
-  `traj.obj_quat == GRAB.global_orient.as_quat()` end-to-end.  We
-  preserved the GRAB convention exactly.
+| Source | What it stores | Δ vs GRAB rotation |
+|---|---|---|
+| GRAB original `obj.params.global_orient` (axis-angle, `|aa|=4.70 rad`) | `R_obj→world` (canonical mocap) | 0° (reference) |
+| Our packed `object_rot_quat` (scipy `R.from_rotvec(aa).as_quat()`, xyzw) | `R_obj→world` | **0.08°** (float32 rounding only) |
+| `leap_passive_active_info_*_nf_300.npy::object_rot_quat` | `R_world→obj` (inverse) | varies 0.5–180°; constant inverse relation under R |
 
-Reproducer: `isaacgymenvs/tasks/dextrack_sharpa/diag_obj_quat_provenance.py`.
-Visual check: `render_hybrid_montage.py` (compares two cube-pose
-conventions side-by-side in the same Sharpa env).
+**Common misreading**: I initially called this a "180° about x-axis offset"
+because the two first-frame quats only differ in the sign of `w`.  That's
+misleading — flipping only `w` is *not* the quaternion double-cover
+(`q` ↔ `-q`); it produces a *different* SO(3) element.  The actual relation
+is `R_leap = R_our.inv()` end-to-end.
+
+**Visual consequence (5 cm symmetric cube)**: even though the cube
+geometry is symmetric, IsaacGym's box mesh has direction-dependent
+shading (face normals, edge highlights), so an inverted rotation
+trajectory looks *different* to the eye — observed as "our cube turns
+further" because GRAB `|aa|=4.70 rad` corresponds to a 269.5° rotation
+about ~+x, while the LEAP-inverse renders the cube at the inverse pose,
+which the renderer paints with different highlights.  Pixel-diff
+verified by `diag_cube_orientation_render.py` (max diff 181/255 inside
+the cube region during the active-rotation segment).
+
+**xyzw byte order is NOT involved.**  Visually verified by
+`diag_quat_render_check.py`: writing `(sin45, 0, 0, cos45)` into a
+fresh cube produces no visible rotation (a 90° rotation about its own
++x axis), and `(0, sin45, 0, cos45)` flips the cube's +x face to
+point down (-Z world) — exactly what scipy-xyzw predicts.  IsaacGym's
+root-state quat slot is xyzw, our packed `object_rot_quat` is xyzw,
+no permutation anywhere.
+
+### Decision: visualize the GRAB ground truth
+
+We keep the canonical `R_obj→world` convention (what our env already does).
+Writing `traj.obj_quat` straight into the root state renders the cube
+through the *true human mocap orientation trajectory* — what GRAB
+captured, not LEAP's inversion of it.  Both conventions are
+self-consistent inside their own retargeter (LEAP's hand_qs is fit
+against the inverted cube, so LEAP visualisations also look correct;
+our hand_qs is fit against the original cube), but only the GRAB-original
+trajectory matches the actual human motion.
+
+If you ever need to render LEAP data inside our env (e.g. for paper
+side-by-side figures), invert the quat at write time:
+
+```python
+q = leap_obj_quat[t]
+# convert R_world→obj  →  R_obj→world
+q_inv = np.array([-q[0], -q[1], -q[2], q[3]])   # unit-quat conjugate
+env.root_states[obj_idx, 3:7] = q_inv
+```
+
+Reproducers:
+- `diag_obj_quat_provenance.py` — three-way GRAB / OUR / LEAP comparison
+- `diag_cube_orientation_render.py` — pixel-diff under OUR vs LEAP quat
+- `diag_quat_render_check.py` — confirms IsaacGym is xyzw via a marker
+- `render_hybrid_montage.py` / `visualize_hybrid_replay.py` — side-by-side
+  viewers that pull cube from LEAP, hand from OURS.
 
 ## 5. Diagnostic helpers for future trips into this swamp
 
