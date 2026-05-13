@@ -2,6 +2,8 @@ params:
   seed: ${...seed}
 
   algo:
+    # DexTrack uses `a2c_continuous_supervised` (their custom variant);
+    # we use stock `a2c_continuous` since the supervised algo is bespoke.
     name: a2c_continuous
 
   model:
@@ -14,6 +16,9 @@ params:
     space:
       continuous:
         mu_activation: None
+        # DexTrack uses sigma_activation=None; our rl_games fork crashes
+        # when sigma drops below 0 (Adam pushes raw param negative), so
+        # use softplus to keep sigma > 0.  See commit a3d08cf rationale.
         sigma_activation: softplus
         mu_init:
           name: default
@@ -23,7 +28,8 @@ params:
         fixed_sigma: 'fixed'
 
     mlp:
-      units: [1024, 1024, 512, 512]
+      # DexTrack HumanoidPPOSupervised.yaml "net v4": huge MLP.
+      units: [8192, 4096, 2048, 1024, 512, 256, 128]
       activation: elu
       d2rl: False
       initializer:
@@ -44,43 +50,43 @@ params:
     normalize_input: True
     normalize_value: True
     normalize_advantage: True
+    value_bootstrap: True               # DexTrack default
+
     reward_shaper:
       scale_value: 0.01
 
+    # ── DexTrack hyperparams (HumanoidPPOSupervised.yaml L161-188) ────────
     num_actors: ${....task.env.numEnvs}
     gamma: 0.99
     tau: 0.95
-    learning_rate: 1e-4
+    learning_rate: 5e-4                 # DexTrack 5e-4 (we had 1e-4)
     lr_schedule: adaptive
-    schedule_type: standard
-    kl_threshold: 0.016
-    score_to_win: 1000000
-    # DexTrack wfranka max_epochs ranges 1000–10000 across experiments;
-    # pick 5000 as a middle default that completes overnight on one A6000.
-    max_epochs: 5000
-    max_frames: 10_000_000_000
-    save_best_after: 100
-    save_frequency: 500
+    kl_threshold: 0.008                 # DexTrack 0.008 (we had 0.016)
+    score_to_win: 20000
+    max_epochs: ${resolve_default:5000,${....max_iterations}}
+    save_best_after: 50
+    save_frequency: 200
     print_stats: True
     grad_norm: 1.0
     entropy_coef: 0.0
     truncate_grads: True
-    e_clip: 0.1
-    # DexTrack default: minibatch_size == numEnvs (8000–10240).
-    minibatch_size: 8192
-    mini_epochs: 4
+    e_clip: 0.2                         # DexTrack 0.2 (we had 0.1)
+    horizon_length: 32                  # DexTrack 32 (we had 16)
+    seq_length: 4                       # DexTrack seq_len: 4
+    mini_epochs: 5                      # DexTrack 5 (we had 4)
     critic_coef: 4.0
     clip_value: True
-    # horizon × num_envs = samples per epoch; 16 × 8192 = 131072.
-    horizon_length: 16
-    seq_length: 16
     bounds_loss_coef: 0.0001
+    # minibatch_size == num_actors (auto-scales with numEnvs in wfranka script).
+    # batch_size = num_actors × horizon_length = numEnvs × 32; with
+    # minibatch_size = numEnvs, that gives 32 minibatch updates per epoch.
+    minibatch_size: ${....task.env.numEnvs}
 
     defer_summaries_sec: 5
     summaries_interval_sec_min: 5
     summaries_interval_sec_max: 300
 
-    # Extra cfg keys this fork's train.py expects (matches VideoRLFollowerPPO.yaml).
+    # Extra keys this fork's train.py reads.  None of them are active here.
     good_reset_boundary: 0
     use_others_experience: 'none'
     off_policy_ratio: 1.0
