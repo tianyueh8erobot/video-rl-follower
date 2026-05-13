@@ -97,7 +97,15 @@ class DexTrackTrajectory:
         dof_pos_np = np.asarray(data.get("hand_qs", data.get("robot_delta_states_weights_np")),
                                 dtype=np.float32)        # (T, 29)
         obj_pos_np = np.asarray(data["object_transl"], dtype=np.float32)   # (T, 3)
-        obj_quat_np = np.asarray(data["object_rot_quat"], dtype=np.float32) # (T, 4) xyzw
+        # NPY stores GRAB-convention quat: R(GRAB_axis_angle) = R_obj→world.
+        # IsaacGym's root-state quat slot expects R_world→obj for what we
+        # observe to be the visually-correct cube orientation (verified by
+        # A/B test: write OUR quat vs invert; only invert tracks the hand
+        # grasp correctly).  LEAP-shipped npys ALREADY store the inverted
+        # form (see docs/ISAACGYM_GOTCHAS.md §4 for the full investigation).
+        obj_quat_np_grab = np.asarray(data["object_rot_quat"], dtype=np.float32)  # GRAB convention
+        obj_quat_np = obj_quat_np_grab.copy()
+        obj_quat_np[:, :3] *= -1.0     # conjugate of unit xyzw = inverse (R_world→obj)
         T = dof_pos_np.shape[0]
         assert obj_pos_np.shape[0] == T and obj_quat_np.shape[0] == T
         assert dof_pos_np.shape[1] == 29, f"expected 29 DOF, got {dof_pos_np.shape[1]}"
@@ -140,7 +148,10 @@ class DexTrackTrajectory:
         # Velocities (np.gradient + gaussian)
         dof_vel_np = _smoothed_velocity(dof_pos_np, dt, smooth_sigma)
         obj_lin_vel_np = _smoothed_velocity(obj_pos_np, dt, smooth_sigma)
-        obj_ang_vel_np = _quat_to_angular_velocity(obj_quat_np, dt, smooth_sigma)
+        # Angular velocity = ω of cube in world frame.  Compute from the
+        # raw GRAB R_obj→world sequence (the physically-meaningful one),
+        # NOT from the inverted sequence we feed to IsaacGym.
+        obj_ang_vel_np = _quat_to_angular_velocity(obj_quat_np_grab, dt, smooth_sigma)
         wrist_lin_vel_np = _smoothed_velocity(wrist_pos_np, dt, smooth_sigma)
         wrist_ang_vel_np = _quat_to_angular_velocity(wrist_quat_np, dt, smooth_sigma)
         link_vel_np = _smoothed_velocity(link_pos_np, dt, smooth_sigma)  # (T, K, 3)

@@ -158,6 +158,8 @@ def set_kinematic_frame(t: int):
         gymtorch.unwrap_tensor(env.cur_targets))
 
     # 3) Object root state (pos + orient + zero linear/angular velocity)
+    # traj.obj_quat is already in IsaacGym's expected convention
+    # (trajectory.py inverts the raw GRAB R_obj→world on load).
     obj_idx = env.object_actor_idx_global[:1].long()
     env.root_states[obj_idx, 0:3] = env.traj.obj_pos[t]
     env.root_states[obj_idx, 3:7] = env.traj.obj_quat[t]
