@@ -76,6 +76,13 @@ env = DexTrackSharpa(cfg=OmegaConf.to_container(cfg, resolve=True),
 print(f"[viz-kinematic] T={env.traj.T}  obj_init z={env.traj.obj_pos[0,2].item():.3f}")
 print("[viz-kinematic] keys: SPACE=step  R=reset  P=auto-play  ESC=quit\n")
 
+# Explicit camera position — default viewer angle often misses the robot.
+# Look down/across at the robot+table+object cluster (robot at origin,
+# table center at x=0.70, object at trajectory[0] ≈ (0.48, -0.06, 0.53)).
+cam_pos    = gymapi.Vec3(1.8, -1.5, 1.5)     # camera eye
+cam_target = gymapi.Vec3(0.4, 0.0, 0.5)      # looking at table mid + obj height
+env.gym.viewer_camera_look_at(env.viewer, env.envs[0], cam_pos, cam_target)
+
 env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_SPACE, "step")
 env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_R,     "reset")
 env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_P,     "play")
