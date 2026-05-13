@@ -1,12 +1,5 @@
-"""Pure kinematic playback of the reference trajectory inside the DexTrackSharpa
-env. NO physics, NO policy — at each step we DIRECTLY set hand DOFs + object
-root state from `traj.dof_pos[t]` / `traj.obj_pos[t]` / `traj.obj_quat[t]`.
-
-Use this to confirm:
-  - robot is placed at the right pose (origin, facing +X)
-  - table is in the right place (in front of the robot, 70cm out)
-  - object initial pose matches the trajectory frame 0
-  - the trajectory itself is feasible / reasonable in the env coordinate frame
+"""Pure kinematic playback of the reference trajectory in the DexTrackSharpa env.
+Forces the robot DOFs + object root state to traj frame t every step.  NO policy.
 
 Run:
   cd ~/Codes/video-rl-follower
@@ -17,6 +10,27 @@ Keys:
   R      reset to frame 0
   P      auto-play loop (toggle)
   ESC    quit
+
+Background — root cause discovered 2026-05-13:
+  IsaacGym's `step_graphics(sim)` ONLY reflects the state from the last
+  `simulate(sim)` call.  Writing through `set_dof_state_tensor_indexed` /
+  `set_actor_root_state_tensor_indexed` updates the simulator's internal
+  state, but the render pipeline ignores those writes unless simulate()
+  is called afterwards.  Therefore kinematic replay MUST call simulate()
+  every frame.  To prevent simulate() from disturbing our forced state:
+
+    (1) zero gravity in sim cfg
+    (2) write zero velocity for DOFs and object root
+    (3) sync PD targets to ref_dof every frame (otherwise PD wakes up
+        with target=0 and yanks every hand joint to zero in one dt,
+        producing the "twisted hand" artifact)
+
+  This matches ManipTrans `DexManipNet/dexmanip_sh.py::play()` which
+  uses the same set→simulate→render pattern.
+
+  Verified via diag_render_no_sim.py (pixel diff = 0 without simulate,
+  = 11.78 with simulate) and diag_set_after_sim.py (set-after-simulate
+  doesn't reach the renderer).
 """
 import os
 import isaacgym
@@ -34,11 +48,11 @@ cfg = OmegaConf.create({
     "env": {
         "numEnvs": 1, "envSpacing": 1.5,
         "episodeLength": 300, "clampAbsObservations": 50.0, "controlFrequencyInv": 1,
-        "dofSpeedScale": 0.0, "frankaDeltaDeltaMultCoef": 0.0,  # kill residual
+        "dofSpeedScale": 0.0, "frankaDeltaDeltaMultCoef": 0.0,
         "actionMovingAverage": 1.0, "randomTime": False,
         "reward_style": "dextrack",
         "reward": {
-            "dextrack":   {"early_terminate_obj_dist": 0.0},   # never terminate during viz
+            "dextrack":   {"early_terminate_obj_dist": 0.0},
             "maniptrans": {"failed_execute_enabled": False},
         },
         "armStiffness": 400.0, "armDamping": 80.0,
@@ -53,12 +67,9 @@ cfg = OmegaConf.create({
         "enableCameraSensors": False,
     },
     "sim": {
-        # ZERO gravity — this script writes DOF + obj state every frame; we
-        # must call simulate() to propagate to the renderer, and simulate()
-        # advances physics 1/60 s.  With gravity on, the object falls and
-        # wobbles between frames; with PD targets out of sync, the hand
-        # twists toward zero pose.  Zero gravity + synced PD targets makes
-        # simulate() a no-op for state but still triggers render updates.
+        # Zero gravity + zero velocities → simulate() is (near-)idempotent
+        # under the forced state we write each frame.  Combined with PD
+        # targets synced to ref_dof, simulate() does not disturb DOFs.
         "dt": 1.0/60.0, "substeps": 2, "up_axis": "z",
         "use_gpu_pipeline": True, "gravity": [0.0, 0.0, 0.0],
         "physx": {
@@ -82,13 +93,9 @@ env = DexTrackSharpa(cfg=OmegaConf.to_container(cfg, resolve=True),
 print(f"[viz-kinematic] T={env.traj.T}  obj_init z={env.traj.obj_pos[0,2].item():.3f}")
 print("[viz-kinematic] keys: SPACE=step  R=reset  P=auto-play  ESC=quit\n")
 
-# Close-up of the robot + hand + object cluster — verified by offscreen render.
-# Earlier camera at (1.8,-1.5,1.5) had the robot looking tiny and easily hidden.
 cam_pos    = gymapi.Vec3(+0.10, -0.70, +0.95)
 cam_target = gymapi.Vec3(+0.45, -0.05, +0.55)
 env.gym.viewer_camera_look_at(env.viewer, env.envs[0], cam_pos, cam_target)
-print(f"[viz] camera (0.10, -0.70, 0.95) → target (0.45, -0.05, 0.55)")
-print("[viz] mouse: right-drag=rotate  scroll=zoom  left-drag=pan")
 
 env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_SPACE, "step")
 env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_R,     "reset")
@@ -96,18 +103,14 @@ env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_P,     "play")
 
 
 def set_kinematic_frame(t: int):
-    """Force the entire scene (robot DOFs + object root) to trajectory frame t.
+    """Force the entire scene to trajectory frame t.
 
-    KEY INSIGHT: do NOT call `gym.simulate()` per frame — it advances physics
-    by dt, which causes:
-      • the object to rotate from finger-contact reaction forces
-      • integration drift in the robot DOFs
-      • PD oscillations even with target = ref_dof
-    Instead we call simulate() ONCE at startup to initialise the render
-    pipeline, then every frame use `step_graphics + draw_viewer` only.
+    Writes BOTH the state and the PD target (synced) so that the upcoming
+    simulate() does not drag any joint via stale PD targets.  Velocities
+    are zeroed so the integrator has nothing to advance.
     """
     t = max(0, min(t, env.traj.T - 1))
-    ref_dof = env.traj.dof_pos[t]                                 # (29,)
+    ref_dof = env.traj.dof_pos[t]
 
     # 1) DOF state (position + zero velocity)
     env.dof_state[0, :, 0] = ref_dof
@@ -116,14 +119,16 @@ def set_kinematic_frame(t: int):
         gymtorch.unwrap_tensor(env.dof_state.view(-1, 2)),
         gymtorch.unwrap_tensor(env.robot_actor_idx_global[:1].contiguous()), 1)
 
-    # 2) PD targets in sync — harmless even without simulate(), and stays
-    #    safe if user holds frame for >1 step (or simulate is invoked again).
+    # 2) PD targets in sync with the desired DOF state.  Without this,
+    #    the PD controller (stiffness 100, damping 4 on the hand) drives
+    #    each hand joint toward 0 inside simulate(), causing visible
+    #    finger twisting within a single frame.
     env.cur_targets[0, :]  = ref_dof
     env.prev_targets[0, :] = ref_dof
     env.gym.set_dof_position_target_tensor(env.sim,
         gymtorch.unwrap_tensor(env.cur_targets))
 
-    # 3) Object root state (pos + orient + zero vel)
+    # 3) Object root state (pos + orient + zero linear/angular velocity)
     obj_idx = env.object_actor_idx_global[:1].long()
     env.root_states[obj_idx, 0:3] = env.traj.obj_pos[t]
     env.root_states[obj_idx, 3:7] = env.traj.obj_quat[t]
@@ -132,45 +137,35 @@ def set_kinematic_frame(t: int):
         gymtorch.unwrap_tensor(env.root_states),
         gymtorch.unwrap_tensor(env.object_actor_idx_global[:1].contiguous()), 1)
 
-    # 4) Refresh gym-side tensors so the renderer reads our writes.
-    #    NO simulate() — that would advance physics and re-introduce the
-    #    contact-spin / PD-twist artifacts.
-    env.gym.refresh_actor_root_state_tensor(env.sim)
-    env.gym.refresh_dof_state_tensor(env.sim)
-    env.gym.refresh_rigid_body_state_tensor(env.sim)
-
-
-# ── Warm the render pipeline ONCE before the main loop.  Without this very
-#    first simulate(), the viewer shows only the initial-spawn scene (table)
-#    even after our state writes — the GPU side of IsaacGym hasn't built up
-#    its visual buffers yet.
-set_kinematic_frame(0)
-env.gym.simulate(env.sim)
-env.gym.fetch_results(env.sim, True)
-set_kinematic_frame(0)        # re-write after the one allowed simulate
-
 
 t = 0
 auto = False
+# Warmup: prime the sim once so the renderer has valid state to display.
 set_kinematic_frame(t)
+env.gym.simulate(env.sim)
+env.gym.fetch_results(env.sim, True)
+env.gym.step_graphics(env.sim)
+
 while not env.gym.query_viewer_has_closed(env.viewer):
     for evt in env.gym.query_viewer_action_events(env.viewer):
         if evt.value <= 0:
             continue
         if evt.action == "step":
             t = (t + 1) % env.traj.T
-            set_kinematic_frame(t)
             print(f"[viz] t={t}  obj=({env.traj.obj_pos[t,0]:.3f}, {env.traj.obj_pos[t,1]:.3f}, {env.traj.obj_pos[t,2]:.3f})")
         elif evt.action == "reset":
             t = 0
-            set_kinematic_frame(t)
             print(f"[viz] reset → t=0")
         elif evt.action == "play":
             auto = not auto
             print(f"[viz] auto-play = {auto}")
     if auto:
         t = (t + 1) % env.traj.T
-        set_kinematic_frame(t)
+
+    # ── set → simulate → render loop (per ManipTrans dexmanip_sh.play()) ──
+    set_kinematic_frame(t)
+    env.gym.simulate(env.sim)
+    env.gym.fetch_results(env.sim, True)
     env.gym.step_graphics(env.sim)
     env.gym.draw_viewer(env.viewer, env.sim, True)
     env.gym.sync_frame_time(env.sim)

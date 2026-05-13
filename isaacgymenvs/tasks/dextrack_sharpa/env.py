@@ -188,6 +188,14 @@ class DexTrackSharpa(VecTask):
         # Trajectory loader (single fixed trajectory, shared across envs)
         self.traj = DexTrackTrajectory(self.trajectory_npy, self.urdf_path,
                                        dt=self.control_dt, device=self.device)
+
+        # === Reorder traj.dof_pos / dof_vel from pytorch_kinematics DOF order
+        # to IsaacGym DOF order. IsaacGym loads Sharpa fingers alphabetically
+        # (index, middle, pinky, ring, thumb); pytorch_kinematics follows URDF
+        # DFS order (thumb, index, middle, ring, pinky). Without this reorder
+        # we write thumb angles into index joints → "twisted hand" in viz and
+        # totally broken training. (Found 2026-05-13 while debugging replay.)
+        self._reorder_traj_to_isaacgym()
         self.episode_T = min(self.traj.T - 1, self.max_episode_length)
 
         # progress_buf in VecTask is num_envs long (step counter); we use it as ref-frame index.
@@ -356,6 +364,41 @@ class DexTrackSharpa(VecTask):
         print(f"[DexTrackSharpa] Created {num_envs} envs; "
               f"rigid_bodies/env = {self.num_rigid_bodies_per_env} "
               f"(robot {self.num_robot_bodies} + object {self.num_object_bodies} + table {self.num_table_bodies})")
+
+    # =======================================================================
+    # DOF order reconciliation (IsaacGym vs pytorch_kinematics)
+    # =======================================================================
+    def _reorder_traj_to_isaacgym(self):
+        """Permute traj.dof_pos / dof_vel from PK joint order to IsaacGym DOF order.
+
+        IsaacGym sorts revolute joints alphabetically within each kinematic
+        subtree, while pytorch_kinematics yields them in URDF DFS order.  We
+        build a per-joint permutation `pk_idx = pk_to_ig[ig_idx]` and apply
+        it as `dof_pos_ig[i] = dof_pos_pk[pk_to_ig[i]]`.
+        """
+        env_ptr     = self.envs[0]
+        robot_actor = self.gym.find_actor_handle(env_ptr, "robot")
+        ig_name_to_idx = self.gym.get_actor_dof_dict(env_ptr, robot_actor)
+        pk_names = self.traj.joint_names
+
+        assert set(pk_names) == set(ig_name_to_idx.keys()), \
+            f"DOF name mismatch: PK={set(pk_names)} vs IG={set(ig_name_to_idx.keys())}"
+
+        pk_name_to_idx = {n: i for i, n in enumerate(pk_names)}
+        ig_idx_to_name = {v: k for k, v in ig_name_to_idx.items()}
+        pk_to_ig = [pk_name_to_idx[ig_idx_to_name[i]] for i in range(len(ig_name_to_idx))]
+        perm = torch.tensor(pk_to_ig, dtype=torch.long, device=self.device)
+
+        # In-place reorder (last dim is DOF axis)
+        self.traj.dof_pos = self.traj.dof_pos[:, perm].contiguous()
+        self.traj.dof_vel = self.traj.dof_vel[:, perm].contiguous()
+        # Keep the new joint name list in IG order (handy for downstream debug)
+        self.traj.joint_names = [ig_idx_to_name[i] for i in range(len(ig_name_to_idx))]
+        # Sanity print (one-time, on env 0)
+        n_arm_reordered = sum(1 for i in range(NUM_ARM_DOFS) if pk_to_ig[i] != i)
+        n_hand_reordered = sum(1 for i in range(NUM_ARM_DOFS, len(pk_to_ig)) if pk_to_ig[i] != i)
+        print(f"[DexTrackSharpa] DOF reorder PK→IG: arm moved={n_arm_reordered}/7, "
+              f"hand moved={n_hand_reordered}/22")
 
     # =======================================================================
     # Buffers (override VecTask defaults if needed)
