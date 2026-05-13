@@ -76,15 +76,13 @@ env = DexTrackSharpa(cfg=OmegaConf.to_container(cfg, resolve=True),
 print(f"[viz-kinematic] T={env.traj.T}  obj_init z={env.traj.obj_pos[0,2].item():.3f}")
 print("[viz-kinematic] keys: SPACE=step  R=reset  P=auto-play  ESC=quit\n")
 
-# Wide bird's-eye view that captures everything from above.
-# Robot base at (0,0,0); table top at z=0.5 spans x∈[0.2,1.2] y∈[-0.5,0.5];
-# Franka arm extends up to z≈0.7+; object at (0.48,-0.06,0.53).
-# Camera placed BEHIND-LEFT-ABOVE the robot looking toward the table.
-cam_pos    = gymapi.Vec3(-1.0, -1.5, 1.8)
-cam_target = gymapi.Vec3(+0.5, +0.0, +0.4)
+# Close-up of the robot + hand + object cluster — verified by offscreen render.
+# Earlier camera at (1.8,-1.5,1.5) had the robot looking tiny and easily hidden.
+cam_pos    = gymapi.Vec3(+0.10, -0.70, +0.95)
+cam_target = gymapi.Vec3(+0.45, -0.05, +0.55)
 env.gym.viewer_camera_look_at(env.viewer, env.envs[0], cam_pos, cam_target)
-print(f"[viz] camera at {(cam_pos.x, cam_pos.y, cam_pos.z)} → looking at {(cam_target.x, cam_target.y, cam_target.z)}")
-print("[viz] USE MOUSE if you cannot see the robot: right-click drag = rotate, scroll = zoom")
+print(f"[viz] camera (0.10, -0.70, 0.95) → target (0.45, -0.05, 0.55)")
+print("[viz] mouse: right-drag=rotate  scroll=zoom  left-drag=pan")
 
 env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_SPACE, "step")
 env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_R,     "reset")
