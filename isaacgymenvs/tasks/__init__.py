@@ -28,9 +28,11 @@
 
 from .simtoolreal.env import SimToolReal
 from .video_rl_follower.env import VideoRLFollower
+from .dextrack_sharpa.env import DexTrackSharpa
 
 # Mappings from strings to environments
 isaacgym_task_map = {
     "SimToolReal": SimToolReal,
     "VideoRLFollower": VideoRLFollower,
+    "DexTrackSharpa": DexTrackSharpa,
 }

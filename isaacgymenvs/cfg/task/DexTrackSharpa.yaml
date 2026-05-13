@@ -1,0 +1,114 @@
+defaults:
+  - _self_
+
+name: DexTrackSharpa
+
+physics_engine: ${..physics_engine}
+
+env:
+  # --- Required by VecTask ---
+  # DexTrack wfranka default: numEnvs=8000-10240, minibatch=numEnvs.
+  numEnvs: ${resolve_default:8192,${...num_envs}}
+  envSpacing: 1.2
+  episodeLength: 300                        # cubesmall single trajectory (300 frames)
+  clampAbsObservations: 50.0
+  controlFrequencyInv: 1                    # 60 Hz
+
+  # --- Residual policy control mode ---
+  # action = clip(net_output, [-1, 1])
+  # target = traj.dof_pos[t+1] + actionScale * action
+  actionScale: 0.1
+  actionMovingAverage: 1.0                  # 1.0 disables smoothing; 0.1 = strong smoothing
+
+  # --- Reset behaviour ---
+  # DexTrack `random_time` (one-shot scattering on the first reset only — all
+  # subsequent resets go to frame 0).  Cf. allegro_hand_tracking_generalist.py
+  # L11535-11542: flag is consumed on first use, then disabled.  Purpose is
+  # critic-warm-start diversity, NOT mid-trajectory training.
+  randomTime: True
+
+  # --- Reward style switch ---
+  # "dextrack"   → DexTrack tracking reward (paper compute_hand_reward_tracking)
+  # "maniptrans" → 13-term ManipTrans Stage-1 imitation reward
+  reward_style: "dextrack"
+
+  # --- Reward knobs (passed as kwargs to the reward fns) ---
+  # DexTrack `run_tracking_headless_grab_single_wfranka.sh` defaults:
+  #   hand_pose_guidance_glb_trans_coef  = 0.6
+  #   hand_pose_guidance_glb_rot_coef    = 0.1
+  #   hand_pose_guidance_fingerpose_coef = 0.1
+  #   rew_finger_obj_dist_coef           = 0.3 (or 0.5 in some variants)
+  #   rew_delta_hand_pose_coef           = 0.5 (or 0.3 / 0.05)
+  reward:
+    dextrack:
+      obj_pos_coef:           1.0
+      obj_rot_coef:           0.33
+      glb_trans_coef:         0.6
+      glb_rot_coef:           0.1
+      fingerpose_coef:        0.1
+      finger_obj_dist_coef:   0.3
+      delta_hand_pose_coef:   0.5
+      wrist_gate_thresh:      0.12
+      finger_dist_cap:        0.6
+      wrist_dist_cap:         0.5
+      reach_goal_bonus:       0.0           # DexTrack default: no extra sparse bonus
+      early_terminate_obj_dist: 0.0         # 0 disables; DexTrack uses 0.2m drift
+    maniptrans:
+      failed_execute_enabled: True
+      failed_execute_progress_threshold: 20
+      scale_factor: 1.0                     # 1.0 = paper thresholds verbatim
+
+  # --- Robot PD gains (Franka + Sharpa) ---
+  armStiffness:  400.0
+  armDamping:    40.0
+  handStiffness: 20.0
+  handDamping:   2.0
+
+  # --- Trajectory ---
+  trajectory:
+    # 29-DOF replay produced by tools/dextrack_sharpa/joint_29dof_ik.py
+    npy_path: "${oc.env:VIDEO_RL_FOLLOWER_ROOT,/home/intel/Codes/video-rl-follower}/data/sharpa_retarget_dextrack/s2_cubesmall_inspect_1_joint29_replay.npy"
+    dt: ${eval:"1.0/60.0"}
+
+  # --- Object (cubesmall ≈ 5cm, 180g) ---
+  object:
+    size:     [0.05, 0.05, 0.05]
+    mass:     0.18
+    friction: 1.0
+
+  # --- Table ---
+  table:
+    size:     [1.0, 1.0, 0.4]
+    pose:     [0.4, 0.0, 0.4]               # x, y, z of table top center
+    friction: 1.0
+
+  # --- Asset paths ---
+  asset:
+    robot: "${oc.env:VIDEO_RL_FOLLOWER_ROOT,/home/intel/Codes/video-rl-follower}/assets/urdf/franka_sharpa_description/franka_panda_sharpa.urdf"
+
+  enableCameraSensors: False
+
+# We do NOT use isaacgymenvs randomization (single fixed trajectory).
+task:
+  randomize: False
+
+sim:
+  dt: ${eval:"1.0/60.0"}
+  substeps: 2
+  up_axis: "z"
+  use_gpu_pipeline: ${eq:${...pipeline},"gpu"}
+  gravity: [0.0, 0.0, -9.81]
+  physx:
+    num_threads: ${....num_threads}
+    solver_type: ${....solver_type}
+    use_gpu: ${contains:"cuda",${....sim_device}}
+    num_position_iterations: 8
+    num_velocity_iterations: 0
+    contact_offset: 0.002
+    rest_offset: 0.0
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 1000.0
+    default_buffer_size_multiplier: 5.0
+    max_gpu_contact_pairs: 8388608
+    num_subscenes: ${....num_subscenes}
+    contact_collection: 0

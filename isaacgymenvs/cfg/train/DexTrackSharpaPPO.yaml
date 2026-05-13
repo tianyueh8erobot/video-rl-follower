@@ -1,0 +1,86 @@
+params:
+  seed: ${...seed}
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: actor_critic
+    separate: False
+
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: softplus
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: 'fixed'
+
+    mlp:
+      units: [1024, 1024, 512, 512]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  load_checkpoint: ${if:${...checkpoint},True,False}
+  load_path: ${...checkpoint}
+
+  config:
+    name: ${resolve_default:DexTrackSharpaPPO,${....experiment}}
+    device_name: ${resolve_default:cuda:0,${....rl_device}}
+    env_name: rlgpu
+    multi_gpu: ${....multi_gpu}
+    ppo: True
+    mixed_precision: True
+    normalize_input: True
+    normalize_value: True
+    normalize_advantage: True
+    reward_shaper:
+      scale_value: 0.01
+
+    num_actors: ${....task.env.numEnvs}
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 1e-4
+    lr_schedule: adaptive
+    schedule_type: standard
+    kl_threshold: 0.016
+    score_to_win: 1000000
+    # DexTrack wfranka max_epochs ranges 1000–10000 across experiments;
+    # pick 5000 as a middle default that completes overnight on one A6000.
+    max_epochs: 5000
+    max_frames: 10_000_000_000
+    save_best_after: 100
+    save_frequency: 500
+    print_stats: True
+    grad_norm: 1.0
+    entropy_coef: 0.0
+    truncate_grads: True
+    e_clip: 0.1
+    # DexTrack default: minibatch_size == numEnvs (8000–10240).
+    minibatch_size: 8192
+    mini_epochs: 4
+    critic_coef: 4.0
+    clip_value: True
+    # horizon × num_envs = samples per epoch; 16 × 8192 = 131072.
+    horizon_length: 16
+    seq_length: 16
+    bounds_loss_coef: 0.0001
+
+    defer_summaries_sec: 5
+    summaries_interval_sec_min: 5
+    summaries_interval_sec_max: 300
+
+    player:
+      deterministic: False
+      games_num: 1000
+      print_stats: False
