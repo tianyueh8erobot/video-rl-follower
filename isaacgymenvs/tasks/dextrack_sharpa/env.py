@@ -119,13 +119,18 @@ class DexTrackSharpa(VecTask):
                                                 else FUTURE_FRAMES_DEXTRACK)
         self.future_frames = future_frames
         self.goal_obs_dim  = get_goal_obs_dim(self.reward_style, future_frames)
-        # Proprio obs (SimToolReal subset, no object shape):
+        # Proprio obs (DexTrack-compatible: includes accumulating-residual state):
         #   joint_pos(29) + joint_vel(29) + prev_targets(29)
+        # + cur_delta_targets_warm(29)   ← DexTrack L7965/8939/9917
+        # + delta_qpos(29) = state - ref ← DexTrack L7857/8824/9780 (state error)
         # + palm_pos(3) + palm_rot(4) + palm_vel(6)
         # + object_pos(3) + object_rot(4) + object_vel(6)
         # + fingertip_pos_rel_palm(5*3=15)
-        # + progress(1) + reward(1)              == 130
-        self.proprio_obs_dim = 29 + 29 + 29 + 3 + 4 + 6 + 3 + 4 + 6 + 15 + 1 + 1
+        # + progress(1) + reward(1)              == 188
+        # Without cur_delta_warm, an MLP policy cannot recover the accumulated
+        # residual (its own integrator state) since past kinematic-ref frames
+        # are not in goal_obs — needed for the residual-control Markov property.
+        self.proprio_obs_dim = 29 + 29 + 29 + 29 + 29 + 3 + 4 + 6 + 3 + 4 + 6 + 15 + 1 + 1
         self.cfg["env"]["numObservations"] = self.proprio_obs_dim + self.goal_obs_dim
         self.cfg["env"]["numStates"]       = self.cfg["env"]["numObservations"]  # symmetric AC
         self.cfg["env"]["numActions"]      = NUM_DOFS
@@ -568,10 +573,18 @@ class DexTrackSharpa(VecTask):
         progress_obs = torch.log(self.progress_buf.float().unsqueeze(-1) / 10.0 + 1.0)
         reward_obs   = self.last_reward.unsqueeze(-1)
 
+        # delta_qpos = current dof - reference dof at the SAME frame the
+        # reward compares against (paper L7857: state error fed back to policy).
+        t_ref = torch.clamp(self.progress_buf, max=self.traj.T - 1)
+        ref_dof_now = self.traj.dof_pos[t_ref]                         # (E, 29)
+        delta_qpos  = self.arm_hand_dof_pos - ref_dof_now              # (E, 29)
+
         proprio = torch.cat([
             self.arm_hand_dof_pos,                                     # 29
             self.arm_hand_dof_vel,                                     # 29
             self.prev_targets,                                         # 29
+            self.cur_delta_targets_warm,                               # 29  (DexTrack L7965)
+            delta_qpos,                                                # 29  (DexTrack L7857)
             palm_pos,                                                  # 3
             palm_rot,                                                  # 4
             torch.cat([palm_lin_vel, palm_ang_vel], dim=-1),           # 6
