@@ -87,8 +87,13 @@ class DexTrackSharpa(VecTask):
         self.object_friction = obj_cfg.get("friction", 1.0)
 
         table_cfg = env_cfg.get("table", {})
-        self.table_size  = table_cfg.get("size",  [1.0, 1.0, 0.4])
-        self.table_pose  = table_cfg.get("pose",  [0.4, 0.0, 0.2])
+        # DexTrack wfranka geometry (allegro_hand_tracking_generalist.py L4990/L5053):
+        #   table_dims = (1, 1, table_z_dim);  default table_z_dim=0.5
+        #   table_pose.p = (0.70, 0, 0.5 * table_z_dim)   ← centre of table
+        # Our retargeted trajectory uses the same convention:
+        #   target wrist mean at world (0.4, 0, 0.7), Franka base at origin.
+        self.table_size  = table_cfg.get("size",  [1.0, 1.0, 0.5])
+        self.table_pose  = table_cfg.get("pose",  [0.70, 0.0, 0.25])
         self.table_friction = table_cfg.get("friction", 1.0)
 
         # PD gains (Franka panda + Sharpa) — same defaults as SimToolReal class.
@@ -263,13 +268,16 @@ class DexTrackSharpa(VecTask):
                                           + self.num_table_bodies)
 
         # --- Per-env spawn ---
+        # DexTrack wfranka: Franka base at WORLD ORIGIN (allegro_hand_tracking_generalist.py L5017
+        # `shadow_hand_start_pose.p = (0, 0, 0)`).  Our retargeted trajectory follows the
+        # same convention: target_center=(0.4, 0, 0.7) wrist mean → Franka base = origin.
         robot_pose = gymapi.Transform()
-        robot_pose.p = gymapi.Vec3(0.0, 0.0, 0.4)   # mounted on table top
+        robot_pose.p = gymapi.Vec3(0.0, 0.0, 0.0)
         robot_pose.r = gymapi.Quat(0, 0, 0, 1)
 
+        # Table pose: centre at cfg.table.pose = (0.70, 0, 0.25) per DexTrack.
         table_pose = gymapi.Transform()
-        table_pose.p = gymapi.Vec3(self.table_pose[0], self.table_pose[1],
-                                    self.table_pose[2] - self.table_size[2] / 2)
+        table_pose.p = gymapi.Vec3(self.table_pose[0], self.table_pose[1], self.table_pose[2])
 
         object_pose = gymapi.Transform()
         object_pose.p = gymapi.Vec3(self.table_pose[0], 0.0,

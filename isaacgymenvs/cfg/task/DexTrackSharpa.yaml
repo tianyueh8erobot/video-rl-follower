@@ -86,10 +86,13 @@ env:
     mass:     0.18
     friction: 1.0
 
-  # --- Table ---
+  # --- Table (DexTrack wfranka geometry) ---
+  # allegro_hand_tracking_generalist.py L4990 / L5053:
+  #   table_dims = (1, 1, 0.5);  table_pose.p = (0.70, 0, 0.25)  ← centre
+  # Top surface at z=0.5, in front of the Franka base by 70 cm.
   table:
-    size:     [1.0, 1.0, 0.4]
-    pose:     [0.4, 0.0, 0.4]               # x, y, z of table top center
+    size:     [1.0, 1.0, 0.5]
+    pose:     [0.70, 0.0, 0.25]             # CENTRE of table (Isaac box convention)
     friction: 1.0
 
   # --- Asset paths ---
