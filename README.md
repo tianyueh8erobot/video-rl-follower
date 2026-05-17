@@ -79,14 +79,18 @@ python tools/build_iiwa14_right_sharpa_urdf.py \
 > intended direction; tweak the `sharpa_mount_to_right_flange` joint origin if
 > not.
 
-## Gotchas
+## Docs
 
-**Read [`docs/ISAACGYM_GOTCHAS.md`](docs/ISAACGYM_GOTCHAS.md) before touching
-the IsaacGym task code.** The top entry — IsaacGym sorts URDF DOFs
-alphabetically while PyBullet / pytorch_kinematics / MuJoCo preserve URDF
-DFS order — silently corrupts both visualisation AND training when a
-trajectory authored against PK order is fed straight into `set_dof_state`.
-Cost us a day; future-you will thank present-you.
+- **[`docs/RETARGETING_AND_ENV_SETUP.md`](docs/RETARGETING_AND_ENV_SETUP.md)** —
+  runbook for retargeting a GRAB clip, building the IsaacGym env, and the
+  coordinate-frame definitions. Follow it when adding a new trajectory or
+  swapping the robot/hand.
+- **[`docs/ISAACGYM_GOTCHAS.md`](docs/ISAACGYM_GOTCHAS.md)** — read this
+  before touching the IsaacGym task code. The top entry — IsaacGym sorts
+  URDF DOFs alphabetically while PyBullet / pytorch_kinematics / MuJoCo
+  preserve URDF DFS order — silently corrupts both visualisation AND
+  training when a trajectory authored against PK order is fed straight
+  into `set_dof_state`. Cost us a day; future-you will thank present-you.
 
 ## Setup
 
