@@ -208,12 +208,22 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 "on_policy_grads" : grads_on.detach().cpu(),
             }
         else:
+            # NOTE: do NOT copy the full gradient vector to CPU here.
+            # `extra_infos['on_policy_grads']` in a2c_common.train_epoch appends
+            # one copy per minibatch (5 mini_epochs x 32 minibatches = 160), and
+            # with a large MLP (~48M params) each copy is ~190 MB → ~60 GB of
+            # host RAM accumulated per epoch → OOM kill.  The grads are only
+            # consumed by an off/on-policy gradient-similarity tensorboard stat
+            # which is meaningless for plain on-policy PPO (off_policy_grads is
+            # all-zeros).  Leave them None; the consumer (a2c_common ~L1620)
+            # skips the stat when they are None.  Set LOG_OFF_POLICY_GRADS to
+            # re-enable the real off-policy gradient logging path above.
             extras = {
                 "on_policy_contrib" : contrib.mean().item(),
                 "off_policy_contrib" : 0,
-                "on_policy_grads" : all_grads.detach().cpu(),
-                "off_policy_grads" : torch.zeros_like(all_grads).cpu(),
-            }     
+                "on_policy_grads" : None,
+                "off_policy_grads" : None,
+            }
         if self.expl_type.startswith('mixed_expl'):
             bl_ids = self.intr_reward_coef_embd[::self.intr_coef_block_size, 0].reshape(-1,1)
             bl_idxs = torch.argmax((obs_batch[:,-self.intr_reward_coef_embd.shape[1]] == bl_ids).float(), dim=0)

@@ -1617,11 +1617,17 @@ class ContinuousA2CBase(A2CBase):
                     self.writer.add_histogram('auxiliary_stats/off_policy_contrib', np.array(extra_infos['off_policy_contrib']), frame)
                     self.writer.add_histogram('auxiliary_stats/on_policy_contrib', np.array(extra_infos['on_policy_contrib']), frame)
 
-                    on_policy_grads = torch.stack(extra_infos['on_policy_grads'])
-                    off_policy_grads = torch.stack(extra_infos['off_policy_grads'])
+                    # Per-minibatch gradient copies are only populated when
+                    # LOG_OFF_POLICY_GRADS is set (see a2c_continuous.calc_gradients);
+                    # otherwise they are None to avoid accumulating ~60 GB of host
+                    # RAM with large MLPs.  Skip the off/on grad-similarity stat
+                    # when they were not collected.
+                    if extra_infos['on_policy_grads'] and extra_infos['on_policy_grads'][0] is not None:
+                        on_policy_grads = torch.stack(extra_infos['on_policy_grads'])
+                        off_policy_grads = torch.stack(extra_infos['off_policy_grads'])
 
-                    self.writer.add_scalar('auxiliary_stats/off_on_grad_similarity', torch.cosine_similarity(on_policy_grads, off_policy_grads).diag().mean(),frame)
-                    self.writer.add_scalar('auxiliary_stats/off_on_relative_grad_norms', torch.norm(off_policy_grads, dim=-1).mean()/torch.norm(on_policy_grads, dim=-1).mean(), frame)
+                        self.writer.add_scalar('auxiliary_stats/off_on_grad_similarity', torch.cosine_similarity(on_policy_grads, off_policy_grads).diag().mean(),frame)
+                        self.writer.add_scalar('auxiliary_stats/off_on_relative_grad_norms', torch.norm(off_policy_grads, dim=-1).mean()/torch.norm(on_policy_grads, dim=-1).mean(), frame)
                     
                     if extra_infos['mb_intr_rewards'] is not None:
                         if hasattr(self, 'intr_coef_block_size'):
