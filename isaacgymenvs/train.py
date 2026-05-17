@@ -330,6 +330,11 @@ if __name__ == "__main__":
             if not isinstance(cfg_n_env, tuple):
                 break
             cfg, vec_env = cfg_n_env
+            # Multi-task restart is a fork feature; for a single-task run the
+            # returned vec_env is not a restartable env object — exit cleanly
+            # after training completes instead of crashing on a missing method.
+            if not hasattr(vec_env, "change_on_restart"):
+                break
             vec_env.change_on_restart(omegaconf_to_dict(cfg.task))
 
     launch()
