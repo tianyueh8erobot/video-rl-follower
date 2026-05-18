@@ -12,7 +12,7 @@ env:
   envSpacing: 1.2
   episodeLength: 300                        # cubesmall single trajectory (300 frames)
   clampAbsObservations: 50.0
-  controlFrequencyInv: 1                    # 60 Hz
+  controlFrequencyInv: 3                    # DexTrack run value (60 Hz sim / 20 Hz control)
 
   # --- Residual policy control mode (DexTrack `use_kinematics_bias_wdelta=True`) ---
   # DexTrack formula (allegro_hand_tracking_generalist.py L12198, L12219):
@@ -20,10 +20,11 @@ env:
   #   cur_delta_targets_warm += delta_delta_targets           (ACCUMULATING)
   #   target = ref + cur_delta_targets_warm
   # speed_scale_per_joint (wfranka, L1388):
-  #   arm 7-DOF : dofSpeedScale × franka_delta_delta_mult_coef = 20 × 2 = 40
-  #   hand 22-DOF: dofSpeedScale = 20
-  # Hand `frankaDeltaDeltaMultCoef` last assignment in run_tracking_*_wfranka.sh:1658 = 2.0.
-  dofSpeedScale:            20.0
+  #   arm 7-DOF : dofSpeedScale × franka_delta_delta_mult_coef = 1 × 2 = 2
+  #   hand 22-DOF: dofSpeedScale = 1
+  # VERIFIED from DexTrack's actual train_pool_2.py run command: dofSpeedScale=1.0
+  # (the earlier value 20.0 was a wrong assumption — the run script overrides to 1.0).
+  dofSpeedScale:            1.0
   frankaDeltaDeltaMultCoef: 2.0
   actionMovingAverage:      1.0             # 1.0 disables smoothing
 
@@ -74,15 +75,17 @@ env:
       failed_execute_progress_threshold: 20
       scale_factor: 1.0                     # 1.0 = paper thresholds verbatim
 
-  # --- Robot PD gains (DexTrack defaults, allegro_hand_tracking_generalist.py) ---
-  #   arm_stiffness = 400.0   (L521 default)
-  #   arm_damping   = 80.0    (L523 default)
-  #   stiffness_coef = 100.0  (L443; applied to hand DOFs in customize_damping path)
-  #   damping_coef   = 4.0    (L444)
+  # --- Robot PD gains (VERIFIED from DexTrack's actual train_pool_2.py run command) ---
+  #   arm:  arm_stiffness=400.0  arm_damping=80.0
+  #   hand: stiffness_coef=210.0  damping_coef=20.0  effort_coef=0.95
+  #   DexTrack applies stiffness_coef / damping_coef / effort_coef DIRECTLY to the
+  #   hand DOF props (allegro_hand_tracking_generalist.py L4798-4800).
+  #   (earlier 100/4 were DexTrack's yaml defaults, NOT the run-script overrides.)
   armStiffness:  400.0
   armDamping:    80.0
-  handStiffness: 100.0
-  handDamping:   4.0
+  handStiffness: 210.0
+  handDamping:   20.0
+  handEffort:    0.95
 
   # --- Trajectory ---
   trajectory:

@@ -111,8 +111,11 @@ class DexTrackSharpa(VecTask):
         #   stiffness_coef=100 / damping_coef=4        (L443/L444, applied to hand DOFs)
         self.arm_stiffness   = env_cfg.get("armStiffness",   400.0)
         self.arm_damping     = env_cfg.get("armDamping",     80.0)
-        self.hand_stiffness  = env_cfg.get("handStiffness",  100.0)
-        self.hand_damping    = env_cfg.get("handDamping",    4.0)
+        # DexTrack run: stiffness_coef=210, damping_coef=20, effort_coef=0.95
+        # applied directly to hand DOFs (allegro_hand_tracking_generalist.py L4798-4800).
+        self.hand_stiffness  = env_cfg.get("handStiffness",  210.0)
+        self.hand_damping    = env_cfg.get("handDamping",    20.0)
+        self.hand_effort     = env_cfg.get("handEffort",     0.95)
 
         # ---- obs / state dims ----
         future_frames = (FUTURE_FRAMES_MANIPTRANS if self.reward_style == "maniptrans"
@@ -272,6 +275,9 @@ class DexTrackSharpa(VecTask):
             else:
                 robot_dof_props["stiffness"][i] = self.hand_stiffness
                 robot_dof_props["damping"][i]   = self.hand_damping
+                # DexTrack sets hand DOF effort = effort_coef (0.95);
+                # our env previously left effort at the URDF default.
+                robot_dof_props["effort"][i]    = self.hand_effort
 
         self.robot_dof_lower = torch.tensor(
             [robot_dof_props["lower"][i] for i in range(self.num_robot_dofs)],
