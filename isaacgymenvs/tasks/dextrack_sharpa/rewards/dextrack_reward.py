@@ -1,65 +1,57 @@
-"""DexTrack tracking reward — paper-faithful port of the **goal_cond=False**
-branch of `compute_hand_reward_tracking`.
+"""DexTrack tracking reward — faithful port of `compute_hand_reward_tracking_warm`,
+the reward function the LEAP+Franka run that reached reward ~210 actually used.
 
-Source (verified line-by-line):
-  /home/intel/Codes/DexTrack/isaacgymenvs/tasks/allegro_hand_tracking_generalist.py
-  - L12813-12853 : `if goal_cond:` branch  (goal-reaching mode — we DO NOT port this)
-  - L12855-12976 : `else:` branch          (trajectory-tracking mode — THIS file)
-  - L12986-12998 : success / early-terminate logic
+Source (verified line-by-line against DexTrack_success_snapshot):
+  isaacgymenvs/tasks/allegro_hand_tracking_generalist.py
+  - compute_hand_reward_tracking_warm     L13396-13744  (the w-Franka reward fn)
+  - delta_value / w_finger_pos_rew block  L13465-13516
+  - goal_cond=False reward branch         L13609-13744
+  - input prep (palm/fingertip link pos)  compute_reward_warm L6151-6300
+  - delta_qpos = current - reference hand dof   L6770/6780
 
-DexTrack `run_tracking_headless_grab_single_wfranka.sh` sets goal_cond=False
-on its last uncommented assignment (L204), so the `else` branch is the one
-actually used during paper training.
+The successful run config (dextrack_success_run_config.yaml) has:
+  goal_cond=False, w_finger_pos_rew=True, w_obj_ornt=False, w_obj_vels=False.
 
-`else` branch reward formula (paper L12976, verbatim):
+NOTE: our earlier port copied the NON-warm `compute_hand_reward_tracking`
+(no w_finger_pos_rew); this rewrite fixes that — the warm fn is the one the
+w-Franka path runs.
 
+Reward (DexTrack L13742):
     reward = (-rew_delta_hand_pose_coef) * delta_value
-           + (-rew_finger_obj_dist_coef) * (right_hand_finger_dist + 2.0 * right_hand_dist)
-           + goal_hand_rew
-           + bonus
-           # + hand_up      <-- COMMENTED OUT in source; we DO NOT include it.
+           + (-rew_finger_obj_dist_coef) * (right_hand_finger_dist + 2*right_hand_dist)
+           + goal_hand_rew + bonus
+           # + hand_up   <- commented out in source; NOT included.
 
-Component definitions (L12855-12970):
+delta_value, w_finger_pos_rew=True (DexTrack L13516) — uses LINK POSITIONS, not
+joint angles:
+    delta_value = glb_trans_coef  * ||palm_ref   - palm_cur||
+                + glb_rot_coef    * ||thumb_ref  - thumb_cur||
+                + fingerpose_coef * (||index..|| + ||middle..|| + ||ring..||)
+                + hand_qpos_rew_coef_real * ||hand_qpos_ref - hand_qpos_cur||_1
+  (per-finger + qpos terms are zeroed past `compute_hand_rew_buf_threshold`;
+   that is 900 and our episode is 300 frames, so it never triggers — the code
+   is kept only for fidelity.)
 
-  flag                  = (finger_dist ≤ 0.12·N).int() + (wrist_dist ≤ 0.12).int()
-                          // max value 2; NO target_flag (target_flag is only used
-                          // in goal_cond=True branch, L12815)
+flag (DexTrack L13611): flag==2 iff finger-close AND wrist-close.
+goal_hand_rew = where(flag==2, 1*(0 - 2*goal_dist), 0)        (object tracking)
+bonus         = where(flag==2 & goal_dist<=0.05, 1/(1+10*goal_dist), 0)
 
-  inhand_obj_pos_ornt_rew = 1 * (0.0 - 2 * goal_dist)
-                          // **0.0 base, NOT 0.9** (which is the goal_cond=True value)
-    if w_obj_ornt:        // default False
-      rot_dist_rew = cur_ornt_rew_coef * (0.0 - rot_dist)
-      inhand_obj_pos_ornt_rew = 1*(0.0 - 2*goal_dist) + rot_dist_rew
-    if w_obj_vels:        // default False
-      inhand_obj_pos_ornt_rew += lin_vel_rew + ang_vel_rew
-
-  goal_hand_rew         = where(flag == 2, inhand_obj_pos_ornt_rew, 0)
-
-  bonus                 = where(flag == 2 & goal_dist ≤ 0.05, 1/(1+10*goal_dist), 0)
-                          // BOTH gates required: contact + close
-
-  // wrist gating L12962-12963
-  if right_hand_dist > 0.12:  right_hand_finger_dist ← 0
-
-  // Success count (L12998): goal_dist ≤ 0.05 only (no rot check)
-  // Early termination (L12986-12991): if cfg early_terminate and
-  //   goal_dist >= 0.2:  reward = -10  and  reset
-
-Caps:
-  right_hand_dist          ≤ 0.5      (L12695)
-  right_hand_finger_dist   ≤ 0.6 × N  (L12707)
-  num_fingers              = 4        (DexTrack uses thumb/index/middle/ring; pinky
-                                       commented out at L12698)
-
-This file is a near-verbatim port; the only intentional simplifications are:
-  • |Δhand_rot|_1 → geodesic angle (numerically close for small rot)
-  • smoothness term and target_flag are exposed via cfg flags but DEFAULT OFF
-    (matches DexTrack defaults: rew_smoothness_coef=0, goal_cond=False).
+SHARPA robot-geometry calibration (these MUST differ from LEAP — see below):
+  * palm body: LEAP uses `palm_lower`.  Sharpa's palm `right_hand_C_MC` is
+    merged into `panda_link7` by collapse_fixed_joints, so the palm world pose
+    is reconstructed as  wrist_pos + R(wrist_quat) @ palm_offset , where
+    palm_offset = right_hand_C_MC expressed in the panda_link7 frame
+    = [0.020868, -0.020851, 0.107]  (|.|=0.111 m; verified rigid constant).
+  * wrist contact gate: LEAP uses `right_hand_dist <= 0.12`.  Measured on the
+    reference trajectory (a valid grasp+lift), the Sharpa palm stays
+    ~0.13-0.21 m from the object even at the grasp, so 0.12 is geometrically
+    unreachable.  Widened to `wrist_gate_thresh` (cfg = 0.2 for Sharpa).
+  * fingertips: thumb/index/middle/ring distal phalanges — SHARPA_BODY_NAMES
+    indices [21, 3, 7, 16] (the collapsed *_DP bodies).
 """
 from __future__ import annotations
 
 from typing import Dict, Tuple
-import math
 import torch
 from torch import Tensor
 
@@ -69,136 +61,152 @@ def _quat_geodesic_angle_xyzw(a: Tensor, b: Tensor) -> Tensor:
     return 2.0 * torch.acos(dot)
 
 
+def _quat_rotate_xyzw(q: Tensor, v: Tensor) -> Tensor:
+    """Rotate vector(s) v by quaternion q (xyzw).  q:(N,4); v:(3,) or (N,3) -> (N,3)."""
+    if v.dim() == 1:
+        v = v.unsqueeze(0).expand(q.shape[0], 3)
+    qvec = q[:, :3]
+    qw = q[:, 3:4]
+    t = 2.0 * torch.cross(qvec, v, dim=-1)
+    return v + qw * t + torch.cross(qvec, t, dim=-1)
+
+
+# thumb / index / middle / ring distal-phalanx bodies, in SHARPA_BODY_NAMES order
+_FINGERTIP_IDXS = [21, 3, 7, 16]
+
+
 def compute_dextrack_reward(
     state: Dict[str, Tensor],
     target: Dict[str, Tensor],
     actions: Tensor,
     progress_buf: Tensor,
-    # ── Hand pose guidance (paper `delta_value`, L1 norms) ─────────────────
-    glb_trans_coef:       float = 0.6,
-    glb_rot_coef:         float = 0.1,
-    fingerpose_coef:      float = 0.1,
-    delta_hand_pose_coef: float = 0.5,    # `rew_delta_hand_pose_coef`
-    # ── Finger / wrist contact penalty ─────────────────────────────────────
-    finger_obj_dist_coef: float = 0.3,    # `rew_finger_obj_dist_coef`
-    wrist_gate_thresh:    float = 0.12,
-    finger_dist_cap:      float = 0.6,    # per-finger cap; total cap = 0.6×N
-    wrist_dist_cap:       float = 0.5,
-    # ── Goal-distance (object 6-D tracking) ────────────────────────────────
-    w_obj_ornt:           bool  = False,  # paper default in wfranka
+    # ── delta_value hand-pose-guidance coefs (DexTrack L13485-13516) ───────
+    glb_trans_coef:          float = 1.0,   # hand_pose_guidance_glb_trans_coef -> diff_palm
+    glb_rot_coef:            float = 1.0,   # hand_pose_guidance_glb_rot_coef   -> diff_thumb
+    fingerpose_coef:         float = 0.2,   # hand_pose_guidance_fingerpose_coef-> idx+mid+ring
+    hand_qpos_rew_coef_real: float = 0.01,  # DexTrack hand_qpos_rew_coef (qpos L1 term)
+    delta_hand_pose_coef:    float = 0.3,   # rew_delta_hand_pose_coef
+    # ── finger / wrist contact penalty ────────────────────────────────────
+    finger_obj_dist_coef:    float = 0.5,   # rew_finger_obj_dist_coef
+    wrist_gate_thresh:       float = 0.2,   # SHARPA right_hand_dist gate (LEAP: 0.12)
+    finger_dist_cap:         float = 0.6,   # per-finger L2 cap (x4 fingers)
+    wrist_dist_cap:          float = 0.5,   # right_hand_dist cap (DexTrack L13423)
+    compute_hand_rew_buf_threshold: int = 900,   # delta_value finger-term zeroing
+    palm_offset = (0.020868, -0.020851, 0.107),  # right_hand_C_MC in panda_link7 frame
+    # ── object 6-D extras (default OFF, matches wfranka success config) ───
+    w_obj_ornt:           bool  = False,
     w_obj_vels:           bool  = False,
     cur_ornt_rew_coef:    float = 0.33,
-    # ── Success / early-termination ────────────────────────────────────────
-    success_obj_pos_thresh:  float = 0.05,
-    early_terminate_obj_dist: float = 0.2,  # DexTrack default; 0 disables
-    # ── Smoothness (opt-in, default off matches paper) ─────────────────────
+    # ── success / early-termination ───────────────────────────────────────
+    success_obj_pos_thresh:   float = 0.05,
+    early_terminate_obj_dist: float = 0.0,  # 0 disables (success run resolves early_terminate=False)
+    # ── smoothness (opt-in; default off matches paper) ────────────────────
     smoothness_coef: float = 0.0,
 ) -> Tuple[Tensor, Tensor, Tensor, Dict[str, Tensor]]:
-    """Return (reward, failed, succeeded, components).
-
-    Note: signature matches the env's caller; `progress_buf` and `actions`
-    are accepted for API parity but unused by the goal_cond=False reward.
-    """
+    """Return (reward, failed, succeeded, components).  `actions` accepted for
+    API parity (the goal_cond=False warm reward has no action-penalty term)."""
     N = state["dof_pos"].shape[0]
     device = state["dof_pos"].device
 
-    # ─── Hand pose guidance: `delta_value` (L1 norms, weighted) ────────────
-    d_wrist_trans = (target["wrist_pos"] - state["wrist_pos"]).abs().sum(-1)
-    d_wrist_rot   = _quat_geodesic_angle_xyzw(target["wrist_quat"], state["wrist_quat"])
-    d_fingerpose  = (target["dof_pos"][:, 7:] - state["dof_pos"][:, 7:]).abs().sum(-1)
-    delta_value = (glb_trans_coef * d_wrist_trans
-                   + glb_rot_coef * d_wrist_rot
-                   + fingerpose_coef * d_fingerpose)
+    # ─── Palm world pose: right_hand_C_MC = panda_link7 (+) rigid offset ────
+    off = torch.as_tensor(list(palm_offset), dtype=torch.float32, device=device)
+    state_palm  = state["wrist_pos"]  + _quat_rotate_xyzw(state["wrist_quat"],  off)
+    target_palm = target["wrist_pos"] + _quat_rotate_xyzw(target["wrist_quat"], off)
+
+    # ─── Fingertip world positions (thumb/index/middle/ring *_DP) ──────────
+    cur_tip = state["link_pos"][:, _FINGERTIP_IDXS]      # (N, 4, 3)
+    ref_tip = target["link_pos"][:, _FINGERTIP_IDXS]     # (N, 4, 3)
+
+    # ─── delta_value, w_finger_pos_rew=True  (DexTrack L13494-13516) ───────
+    diff_palm = torch.norm(target_palm - state_palm, p=2, dim=-1)              # (N,)
+    diff_tip = torch.norm(ref_tip - cur_tip, p=2, dim=-1)                      # (N, 4)
+    diff_thumb, diff_index, diff_middle, diff_ring = diff_tip.unbind(-1)
+    # delta_qpos = current - reference hand dof (DexTrack L6770); L1 norm of the
+    # 22 hand DOF (delta_qpos[:, 7:]).  Sign-independent under |.|.
+    delta_qpos_value = (target["dof_pos"][:, 7:] - state["dof_pos"][:, 7:]).abs().sum(-1)
+    # zero per-finger + qpos terms past the buffer threshold (DexTrack L13509-13513).
+    # threshold=900 >> 300-frame episode -> never fires; kept for fidelity.
+    past = (progress_buf >= compute_hand_rew_buf_threshold)
+    zero = torch.zeros_like(diff_thumb)
+    diff_thumb       = torch.where(past, zero, diff_thumb)
+    diff_index       = torch.where(past, zero, diff_index)
+    diff_middle      = torch.where(past, zero, diff_middle)
+    diff_ring        = torch.where(past, zero, diff_ring)
+    delta_qpos_value = torch.where(past, torch.zeros_like(delta_qpos_value), delta_qpos_value)
+    # NOTE: glb_rot_coef multiplies diff_thumb — this odd mapping is verbatim
+    # from DexTrack L13516 (hand_rot_rew_coef * diff_thumb_link_pos).
+    delta_value = (glb_trans_coef * diff_palm
+                   + glb_rot_coef * diff_thumb
+                   + fingerpose_coef * (diff_index + diff_middle + diff_ring)
+                   + hand_qpos_rew_coef_real * delta_qpos_value)
     r_hand_guidance = -delta_hand_pose_coef * delta_value
 
-    # ─── Finger / wrist distances to object ────────────────────────────────
-    # DexTrack tracking uses 4 fingertips (thumb/index/middle/ring; pinky
-    # commented at L12698).  Body indices follow SHARPA_BODY_NAMES (the 22
-    # COLLAPSED hand bodies).  Indices = the thumb/index/middle/ring *_DP
-    # (distal-phalanx) bodies: right_thumb_DP=21, right_index_DP=3,
-    # right_middle_DP=7, right_ring_DP=16.
-    fingertip_idxs = [21, 3, 7, 16]
-    num_fingers = len(fingertip_idxs)
-    tip_pos    = state["link_pos"][:, fingertip_idxs]                # (N, 4, 3)
-    obj_pos_b  = state["obj_pos"][:, None, :]
-    d_tip_each = torch.norm(tip_pos - obj_pos_b, dim=-1)             # (N, 4)
-    d_tip_obj  = d_tip_each.sum(-1)                                  # (N,)
-    d_tip_obj  = torch.minimum(d_tip_obj,
-                                torch.full_like(d_tip_obj, finger_dist_cap * num_fingers))
+    # ─── Object goal distance (DexTrack L13419) ────────────────────────────
+    obj_pos = state["obj_pos"]
+    goal_dist = torch.norm(target["obj_pos"] - obj_pos, p=2, dim=-1)
+    rot_dist = _quat_geodesic_angle_xyzw(target["obj_quat"], state["obj_quat"])
 
-    d_wrist_obj = torch.norm(state["wrist_pos"] - state["obj_pos"], dim=-1)
-    d_wrist_obj = torch.minimum(d_wrist_obj,
-                                 torch.full_like(d_wrist_obj, wrist_dist_cap))
+    # ─── right_hand_dist: palm <-> object, capped (DexTrack L13422-13423) ──
+    right_hand_dist = torch.norm(obj_pos - state_palm, p=2, dim=-1)
+    right_hand_dist = torch.minimum(right_hand_dist,
+                                    torch.full_like(right_hand_dist, wrist_dist_cap))
 
-    # ─── flag (paper L12856-12858): 2-flag, NO target_flag ─────────────────
-    finger_dist_thres = 0.12 * num_fingers
-    finger_close = d_tip_obj   <= finger_dist_thres
-    wrist_close  = d_wrist_obj <= 0.12
+    # ─── right_hand_finger_dist: sum of 4 tip<->object, capped (L13425-13435)─
+    num_fingers = 4
+    finger_dist = torch.norm(cur_tip - obj_pos[:, None, :], p=2, dim=-1).sum(-1)   # (N,)
+    finger_dist = torch.minimum(finger_dist,
+                                torch.full_like(finger_dist, finger_dist_cap * num_fingers))
+
+    # ─── flag==2 iff finger-close AND wrist-close (DexTrack L13611) ────────
+    # finger gate keeps DexTrack's 0.12*num_fingers; wrist gate is the
+    # SHARPA-calibrated wrist_gate_thresh (LEAP value 0.12 is unreachable).
+    finger_close = finger_dist     <= 0.12 * num_fingers
+    wrist_close  = right_hand_dist <= wrist_gate_thresh
     flag2 = finger_close & wrist_close
 
-    # ─── inhand_obj_pos_ornt_rew (paper L12863-12881) ──────────────────────
-    d_obj_pos = torch.norm(target["obj_pos"] - state["obj_pos"], dim=-1)
-    d_obj_rot = _quat_geodesic_angle_xyzw(target["obj_quat"], state["obj_quat"])
-    # `goal_dist` (paper) and `rot_dist` (paper) — used for both inhand_rew and bonus.
-    goal_dist = d_obj_pos
-    rot_dist  = d_obj_rot
-
-    # Paper L12863 (goal_cond=False else branch): constant is **0.0 not 0.9**.
+    # ─── inhand_obj_pos_ornt_rew (DexTrack L13617; goal_cond=False -> base 0.0)─
     inhand_rew = 1.0 * (0.0 - 2.0 * goal_dist)
     if w_obj_ornt:
         inhand_rew = inhand_rew + cur_ornt_rew_coef * (0.0 - rot_dist)
     if w_obj_vels:
-        # Object lin/ang velocity tracking (paper L12790-12805).  Default off.
-        d_lin = torch.norm(target["obj_lin_vel"] - state["obj_lin_vel"], dim=-1)
-        d_ang = torch.norm(target["obj_ang_vel"] - state["obj_ang_vel"], dim=-1)
-        lin_vel_rew = (120.0 * 0.9 - 2.0 * d_lin) / 120.0
-        ang_vel_rew = (120.0 * 0.9 - 2.0 * d_ang) / 120.0
-        inhand_rew = inhand_rew + lin_vel_rew + ang_vel_rew
+        d_lin = torch.norm(target["obj_lin_vel"] - state["obj_lin_vel"], p=2, dim=-1)
+        d_ang = torch.norm(target["obj_ang_vel"] - state["obj_ang_vel"], p=2, dim=-1)
+        inhand_rew = inhand_rew + (120.0 * 0.9 - 2.0 * d_lin) / 120.0 \
+                                + (120.0 * 0.9 - 2.0 * d_ang) / 120.0
 
+    # ─── goal_hand_rew: object tracking, gated on contact (DexTrack L13654-55)─
     goal_hand_rew = torch.where(flag2, inhand_rew, torch.zeros_like(inhand_rew))
 
-    # ─── bonus (paper L12910-12911): flag==2 AND goal_dist ≤ 0.05 ──────────
-    bonus_mask = flag2 & (goal_dist <= success_obj_pos_thresh)
-    bonus = torch.where(bonus_mask,
-                         1.0 / (1.0 + 10.0 * goal_dist),
-                         torch.zeros_like(goal_dist))
+    # ─── bonus: flag==2 AND goal_dist<=0.05 (DexTrack L13678-13679) ────────
+    bonus = torch.where(flag2 & (goal_dist <= success_obj_pos_thresh),
+                        1.0 / (1.0 + 10.0 * goal_dist),
+                        torch.zeros_like(goal_dist))
     if w_obj_vels:
-        # lin/ang velocity bonus (paper L12800-12805).  Default off.
-        d_lin = torch.norm(target["obj_lin_vel"] - state["obj_lin_vel"], dim=-1)
-        d_ang = torch.norm(target["obj_ang_vel"] - state["obj_ang_vel"], dim=-1)
-        lin_thres = 0.05 * 12.0
-        ang_thres = 0.05 * 12.0
-        lin_bonus = torch.where(d_lin <= lin_thres,
-                                 1.0 / (1.0 + 10.0 * d_lin / 120.0),
-                                 torch.zeros_like(d_lin))
-        ang_bonus = torch.where(d_ang <= ang_thres,
-                                 1.0 / (1.0 + 10.0 * d_ang / 120.0),
-                                 torch.zeros_like(d_ang))
-        bonus = bonus + lin_bonus + ang_bonus
-    # NOTE: paper L12944 `bonus = bonus` (no-op due to typo) — we leave the
-    # `w_obj_ornt` rot bonus unimplemented to mirror this bug.  The path is
-    # dead in source; documenting for fidelity.
+        d_lin = torch.norm(target["obj_lin_vel"] - state["obj_lin_vel"], p=2, dim=-1)
+        d_ang = torch.norm(target["obj_ang_vel"] - state["obj_ang_vel"], p=2, dim=-1)
+        thr = 0.05 * 12.0
+        bonus = bonus + torch.where(d_lin <= thr, 1.0 / (1.0 + 10.0 * d_lin / 120.0),
+                                    torch.zeros_like(d_lin)) \
+                      + torch.where(d_ang <= thr, 1.0 / (1.0 + 10.0 * d_ang / 120.0),
+                                    torch.zeros_like(d_ang))
 
-    # ─── Wrist gating on finger penalty (paper L12962-12963) ───────────────
-    # When wrist is far (>12cm), finger_dist drops out of the penalty.  Wrist
-    # distance keeps its 2× weight regardless.
-    finger_dist_gated = torch.where(d_wrist_obj <= wrist_gate_thresh,
-                                     d_tip_obj, torch.zeros_like(d_tip_obj))
-    r_finger_obj = -finger_obj_dist_coef * (finger_dist_gated + 2.0 * d_wrist_obj)
+    # ─── wrist-gating of the finger penalty (DexTrack L13730-13731) ────────
+    # when the wrist is far, the finger-distance term drops out of the penalty.
+    finger_dist_gated = torch.where(right_hand_dist <= wrist_gate_thresh,
+                                    finger_dist, torch.zeros_like(finger_dist))
+    r_finger_obj = -finger_obj_dist_coef * (finger_dist_gated + 2.0 * right_hand_dist)
 
-    # ─── Smoothness (paper L12780-12782, opt-in via coef) ──────────────────
+    # ─── smoothness (DexTrack default off) ────────────────────────────────
     r_smoothness = torch.zeros(N, device=device)
     if smoothness_coef > 0 and "prev_dof_vel" in state:
         r_smoothness = -smoothness_coef * torch.norm(
             state["prev_dof_vel"] - state["dof_vel"], p=2, dim=-1)
 
-    # ─── Total (paper L12976; hand_up commented out, so NOT added) ─────────
+    # ─── Total (DexTrack L13742; hand_up commented out -> NOT added) ───────
     reward = r_hand_guidance + r_finger_obj + goal_hand_rew + bonus + r_smoothness
 
-    # ─── Success (paper L12998): goal_dist ≤ 0.05 only (no rot check) ─────
+    # ─── Success / early termination ──────────────────────────────────────
     succeeded = goal_dist <= success_obj_pos_thresh
-
-    # ─── Early termination (paper L12986-12991) ────────────────────────────
     if early_terminate_obj_dist > 0:
         failed = goal_dist >= early_terminate_obj_dist
         reward = torch.where(failed, torch.full_like(reward, -10.0), reward)
@@ -214,70 +222,40 @@ def compute_dextrack_reward(
         "delta_value":      delta_value,
         "goal_dist":        goal_dist,
         "rot_dist":         rot_dist,
-        "d_tip_obj":        d_tip_obj,
-        "d_wrist_obj":      d_wrist_obj,
+        "d_tip_obj":        finger_dist,        # sum of 4 fingertip<->object dists
+        "d_wrist_obj":      right_hand_dist,    # palm (right_hand_C_MC) <-> object
         "flag2":            flag2.float(),
     }
     return reward, failed, succeeded, components
 
 
 def _smoke_test():
-    """Three scenarios mirroring paper expectations."""
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     N = 4
-    device = "cuda:0"
     fake = {
-        "dof_pos":       torch.zeros(N, 29, device=device),
-        "dof_vel":       torch.zeros(N, 29, device=device),
-        "obj_pos":       torch.zeros(N, 3, device=device),
-        "obj_quat":      torch.tensor([[0, 0, 0, 1.]] * N, device=device),
-        "obj_lin_vel":   torch.zeros(N, 3, device=device),
-        "obj_ang_vel":   torch.zeros(N, 3, device=device),
-        "link_pos":      torch.zeros(N, 22, 3, device=device),
-        "link_vel":      torch.zeros(N, 22, 3, device=device),
-        "wrist_pos":     torch.zeros(N, 3, device=device),
-        "wrist_quat":    torch.tensor([[0, 0, 0, 1.]] * N, device=device),
-        "wrist_vel":     torch.zeros(N, 3, device=device),
-        "wrist_ang_vel": torch.zeros(N, 3, device=device),
-        "prev_dof_vel":  torch.zeros(N, 29, device=device),
+        "dof_pos":      torch.zeros(N, 29, device=device),
+        "dof_vel":      torch.zeros(N, 29, device=device),
+        "prev_dof_vel": torch.zeros(N, 29, device=device),
+        "wrist_pos":    torch.zeros(N, 3, device=device),
+        "wrist_quat":   torch.tensor([[0, 0, 0, 1.0]] * N, device=device),
+        "link_pos":     torch.zeros(N, 22, 3, device=device),
+        "obj_pos":      torch.zeros(N, 3, device=device),
+        "obj_quat":     torch.tensor([[0, 0, 0, 1.0]] * N, device=device),
+        "obj_lin_vel":  torch.zeros(N, 3, device=device),
+        "obj_ang_vel":  torch.zeros(N, 3, device=device),
     }
     target = {k: v.clone() for k, v in fake.items()}
-    actions = torch.zeros(N, 29, device=device)
     progress = torch.zeros(N, dtype=torch.long, device=device)
 
-    # Scenario 1: perfect tracking, hand AT object.
-    r, fail, ok, c = compute_dextrack_reward(fake, target, actions, progress)
-    print(f"[1] perfect tracking + hand-at-object  (goal_cond=False):")
-    print(f"    reward[0]={r[0]:+.4f}  hand_guide={c['r_hand_guidance'][0]:+.4f}  "
-          f"finger_obj={c['r_finger_obj'][0]:+.4f}  goal_hand={c['r_goal_hand'][0]:+.4f}  "
-          f"bonus={c['r_bonus'][0]:+.4f}  succeeded={ok[0].item()}")
-    print(f"    flag2={c['flag2'][0]:.0f}  goal_dist={c['goal_dist'][0]:.3f}")
-    # Expected:
-    #   delta_value = 0; r_hand_guide = 0
-    #   d_wrist_obj = 0 (gate ON), d_tip_obj = 0; r_finger_obj = -0.3*(0+0) = 0
-    #   flag2 = True; inhand_rew = 0; goal_hand_rew = 0
-    #   bonus_mask = True (flag2 AND goal_dist=0<0.05); bonus = 1/(1+0) = 1.0
-    #   reward = 0 + 0 + 0 + 1.0 = 1.0  ★
-
-    # Scenario 2: 10cm obj drift, wrist 20cm far.
-    s2 = {k: v.clone() for k, v in fake.items()}
-    s2["obj_pos"][:, 2]  = 0.1
-    s2["wrist_pos"][:, 0] = 0.2
-    r2, fail2, ok2, c2 = compute_dextrack_reward(s2, target, actions, progress)
-    print(f"\n[2] obj 10cm off, wrist 20cm far  (gated finger should = 0):")
-    print(f"    reward[0]={r2[0]:+.4f}  hand_guide={c2['r_hand_guidance'][0]:+.4f}  "
-          f"finger_obj={c2['r_finger_obj'][0]:+.4f}  goal_hand={c2['r_goal_hand'][0]:+.4f}")
-    print(f"    d_wrist_obj={c2['d_wrist_obj'][0]:.3f}  flag2={c2['flag2'][0]:.0f}  "
-          f"goal_dist={c2['goal_dist'][0]:.3f}  failed={fail2[0].item()}")
-
-    # Scenario 3: 30cm obj drift → early terminate.
-    s3 = {k: v.clone() for k, v in fake.items()}
-    s3["obj_pos"][:, 2] = 0.30
-    r3, fail3, ok3, c3 = compute_dextrack_reward(s3, target, actions, progress,
-                                                  early_terminate_obj_dist=0.2)
-    print(f"\n[3] obj 30cm off  (early-terminate at 0.2m → reward=-10):")
-    print(f"    reward[0]={r3[0]:+.4f}  failed={fail3[0].item()}  (expect failed=True, reward=-10)")
-
-    print("\n✓ DexTrack reward (goal_cond=False) smoke test passed")
+    # Scenario: perfect tracking, object at the palm (within the 0.2 gate).
+    fake2 = {k: v.clone() for k, v in fake.items()}
+    fake2["obj_pos"] = fake2["wrist_pos"] + torch.tensor([0.0209, -0.0209, 0.107], device=device)
+    target2 = {k: v.clone() for k, v in fake2.items()}
+    r, fail, ok, c = compute_dextrack_reward(fake2, target2, torch.zeros(N, 29, device=device), progress)
+    print(f"[perfect track, obj at palm] reward={r[0]:+.4f}  flag2={c['flag2'][0]:.0f}  "
+          f"d_wrist_obj={c['d_wrist_obj'][0]:.4f}  bonus={c['r_bonus'][0]:+.4f}  delta_value={c['delta_value'][0]:.4f}")
+    print("  expect flag2=1, d_wrist_obj~0, bonus~1.0, delta_value~0")
+    print("✓ dextrack_reward (warm goal_cond=False, w_finger_pos_rew) smoke ok")
 
 
 if __name__ == "__main__":

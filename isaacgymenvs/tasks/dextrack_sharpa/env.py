@@ -70,11 +70,11 @@ class DexTrackSharpa(VecTask):
         self.franka_delta_mult = env_cfg.get("frankaDeltaDeltaMultCoef", 2.0)
         self.action_moving_avg = env_cfg.get("actionMovingAverage", 1.0)
         # Cartesian-IK arm control (DexTrack control_arm_via_ik=True).
-        # 0.01 = wfranka RUN-SCRIPT value (run_tracking_headless_grab_single_wfranka
-        # .sh L1765-1766, last uncommented export).  0.04 was only the
-        # AllegroHandTrackingGeneralist.yaml default — the run script overrides it.
-        self.warm_trans_mult = env_cfg.get("warmTransActionsMultCoef", 0.01)
-        self.warm_rot_mult   = env_cfg.get("warmRotActionsMultCoef", 0.01)
+        # 0.04 = the value in the resolved config of the LEAP+Franka run that
+        # reached reward ~210 (dextrack_success_run_config.yaml).  An earlier
+        # 0.04->0.01 change was wrong (followed a run-script line, not that config).
+        self.warm_trans_mult = env_cfg.get("warmTransActionsMultCoef", 0.04)
+        self.warm_rot_mult   = env_cfg.get("warmRotActionsMultCoef", 0.04)
 
         # DexTrack-style one-shot progress scattering on first reset
         # (cfg key `randomTime` follows DexTrack `random_time` semantics: cfg-True →

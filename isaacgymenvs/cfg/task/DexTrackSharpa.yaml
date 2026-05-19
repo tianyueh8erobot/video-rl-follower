@@ -29,11 +29,12 @@ env:
   actionMovingAverage:      1.0             # 1.0 disables smoothing
   # Cartesian-IK arm control (DexTrack control_arm_via_ik=True): the 7 Franka
   # joints are driven by a 6-D Cartesian dpose through damped-least-squares IK.
-  # warm_*_actions_mult_coef = 0.01 — the wfranka run-script value
-  # (run_tracking_headless_grab_single_wfranka.sh L1765-1766).  The 0.04 we had
-  # was only the AllegroHandTrackingGeneralist.yaml default (the run overrides it).
-  warmTransActionsMultCoef: 0.01
-  warmRotActionsMultCoef:   0.01
+  # warm_*_actions_mult_coef = 0.04 — the value in the resolved config of the
+  # LEAP+Franka run that reached reward ~210 (dextrack_success_run_config.yaml).
+  # An earlier 0.04->0.01 change was wrong: it followed a run-script line, not
+  # the resolved config of the actual successful run.
+  warmTransActionsMultCoef: 0.04
+  warmRotActionsMultCoef:   0.04
 
   # --- Reset behaviour ---
   # DexTrack `random_time` (one-shot scattering on the first reset only — all
@@ -55,19 +56,23 @@ env:
   #   rew_finger_obj_dist_coef           = 0.3 (or 0.5 in some variants)
   #   rew_delta_hand_pose_coef           = 0.5 (or 0.3 / 0.05)
   reward:
-    # All defaults match the wfranka run_tracking_headless_grab_single_wfranka.sh
-    # (goal_cond=False branch in compute_hand_reward_tracking, L12855-12976).
+    # Faithful port of compute_hand_reward_tracking_WARM (the reward fn the LEAP+
+    # Franka success run used), goal_cond=False, w_finger_pos_rew=True.  Coef
+    # values = the verified LEAP-success config (dextrack_success_run_config.yaml).
     dextrack:
       # ── Hand pose guidance (`delta_value`) ─────────────────────────────
-      glb_trans_coef:       0.6        # hand_pose_guidance_glb_trans_coef
-      glb_rot_coef:         0.1        # hand_pose_guidance_glb_rot_coef
-      fingerpose_coef:      0.1        # hand_pose_guidance_fingerpose_coef
-      delta_hand_pose_coef: 0.5        # rew_delta_hand_pose_coef
+      glb_trans_coef:          1.0     # was 0.6 — LEAP-success cfg (hand_pose_guidance_glb_trans_coef)
+      glb_rot_coef:            1.0     # was 0.1 — LEAP-success cfg (hand_pose_guidance_glb_rot_coef)
+      fingerpose_coef:         0.2     # was 0.1 — LEAP-success cfg (hand_pose_guidance_fingerpose_coef)
+      hand_qpos_rew_coef_real: 0.01    # NEW — DexTrack hand_qpos_rew_coef (qpos L1 term in delta_value)
+      delta_hand_pose_coef:    0.3     # was 0.5 — rew_delta_hand_pose_coef
       # ── Finger/wrist contact penalty ───────────────────────────────────
-      finger_obj_dist_coef: 0.3        # rew_finger_obj_dist_coef
-      wrist_gate_thresh:    0.12       # paper L12962
+      finger_obj_dist_coef: 0.5        # was 0.3 — rew_finger_obj_dist_coef
+      wrist_gate_thresh:    0.2        # was 0.12 — SHARPA right_hand_dist gate (LEAP 0.12 unreachable)
       finger_dist_cap:      0.6        # per-finger L2 cap (×4 fingers)
-      wrist_dist_cap:       0.5        # wrist L2 cap
+      wrist_dist_cap:       0.5        # right_hand_dist L2 cap
+      compute_hand_rew_buf_threshold: 900   # delta_value finger-term zeroing (no-op at 300-frame episode)
+      palm_offset: [0.020868, -0.020851, 0.107]   # right_hand_C_MC in panda_link7 frame (palm; rigid constant)
       # ── Goal 6-D extras (default OFF, matches wfranka) ─────────────────
       w_obj_ornt:           False      # add rotation distance term?
       w_obj_vels:           False      # add object lin/ang velocity terms?
