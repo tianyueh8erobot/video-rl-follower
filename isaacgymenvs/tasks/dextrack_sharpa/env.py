@@ -29,8 +29,9 @@ from isaacgym.torch_utils import to_torch
 
 from isaacgymenvs.tasks.base.vec_task import VecTask
 
-from .trajectory   import DexTrackTrajectory, SHARPA_BODY_NAMES, WRIST_LINK
+from .trajectory   import DexTrackTrajectory, SHARPA_BODY_NAMES, WRIST_LINK, FINGERTIP_LINKS
 from .rewards      import compute_maniptrans_reward, compute_dextrack_reward
+from .adjacent_links import PANDA_SHARPA_RIGHT_LINK_TO_ADJACENT_LINKS
 from .obs.goal_obs import (
     build_maniptrans_goal_obs, build_dextrack_goal_obs, get_goal_obs_dim,
     FUTURE_FRAMES_MANIPTRANS, FUTURE_FRAMES_DEXTRACK,
@@ -40,7 +41,7 @@ from .obs.goal_obs import (
 NUM_ARM_DOFS  = 7              # Franka panda joints
 NUM_HAND_DOFS = 22             # Sharpa right hand
 NUM_DOFS      = NUM_ARM_DOFS + NUM_HAND_DOFS                  # 29
-NUM_BODIES_HAND = len(SHARPA_BODY_NAMES)                       # 28 (idx 0 = wrist)
+NUM_BODIES_HAND = len(SHARPA_BODY_NAMES)                       # 22 (collapsed hand bodies)
 N_FINGERTIPS = 5
 
 
@@ -68,6 +69,12 @@ class DexTrackSharpa(VecTask):
         self.dof_speed_scale   = env_cfg.get("dofSpeedScale", 20.0)
         self.franka_delta_mult = env_cfg.get("frankaDeltaDeltaMultCoef", 2.0)
         self.action_moving_avg = env_cfg.get("actionMovingAverage", 1.0)
+        # Cartesian-IK arm control (DexTrack control_arm_via_ik=True).
+        # 0.01 = wfranka RUN-SCRIPT value (run_tracking_headless_grab_single_wfranka
+        # .sh L1765-1766, last uncommented export).  0.04 was only the
+        # AllegroHandTrackingGeneralist.yaml default — the run script overrides it.
+        self.warm_trans_mult = env_cfg.get("warmTransActionsMultCoef", 0.01)
+        self.warm_rot_mult   = env_cfg.get("warmRotActionsMultCoef", 0.01)
 
         # DexTrack-style one-shot progress scattering on first reset
         # (cfg key `randomTime` follows DexTrack `random_time` semantics: cfg-True →
@@ -105,12 +112,15 @@ class DexTrackSharpa(VecTask):
         self.table_pose  = table_cfg.get("pose",  [0.70, 0.0, 0.25])
         self.table_friction = table_cfg.get("friction", 1.0)
 
-        # PD gains (Franka panda + Sharpa) — same defaults as SimToolReal class.
-        # DexTrack defaults (allegro_hand_tracking_generalist.py):
-        #   arm_stiffness=400 / arm_damping=80         (L521/L523)
-        #   stiffness_coef=100 / damping_coef=4        (L443/L444, applied to hand DOFs)
+        # PD gains (Franka panda + Sharpa) — VERIFIED from the wfranka run script.
+        # DexTrack arm DOF props (allegro_hand_tracking_generalist.py L4793-4795):
+        #   arm_stiffness=400, arm_effort=400, arm_damping=80  (wfranka L1016-1018)
         self.arm_stiffness   = env_cfg.get("armStiffness",   400.0)
         self.arm_damping     = env_cfg.get("armDamping",     80.0)
+        # arm_effort: DexTrack sets the arm DOF effort = 400 (wfranka L1017).  Our
+        # env previously did NOT set arm effort → it stayed at the Franka URDF
+        # default (~12-87 N·m) → the arm could not apply enough joint torque.
+        self.arm_effort      = env_cfg.get("armEffort",      400.0)
         # DexTrack run: stiffness_coef=210, damping_coef=20, effort_coef=0.95
         # applied directly to hand DOFs (allegro_hand_tracking_generalist.py L4798-4800).
         self.hand_stiffness  = env_cfg.get("handStiffness",  210.0)
@@ -157,6 +167,10 @@ class DexTrackSharpa(VecTask):
         self.rigid_body_state = gymtorch.wrap_tensor(rigid_body_state).view(
             self.num_envs, self.num_rigid_bodies_per_env, 13)
         self.dof_force       = gymtorch.wrap_tensor(dof_force_state).view(self.num_envs, NUM_DOFS)
+        # Jacobian for Cartesian-IK arm control (DexTrack control_arm_via_ik).
+        # Shape (num_envs, num_links-1, 6, NUM_DOFS); arm columns are [..., :7].
+        self.jacobian_tensor = gymtorch.wrap_tensor(
+            self.gym.acquire_jacobian_tensor(self.sim, "robot"))
 
         self.arm_hand_dof_pos = self.dof_state[..., 0]
         self.arm_hand_dof_vel = self.dof_state[..., 1]
@@ -204,14 +218,17 @@ class DexTrackSharpa(VecTask):
         # progress_buf in VecTask is num_envs long (step counter); we use it as ref-frame index.
         self.last_reward = torch.zeros(self.num_envs, device=self.device)
         self.successes   = torch.zeros(self.num_envs, device=self.device)
+        self._dbg_step = 0
 
-        # Cache wrist body index (in rigid_body_state per-env)
+        # Cache wrist body index (in rigid_body_state per-env).  After collapse,
+        # WRIST_LINK == panda_link7 (the merged hand-base body).
         self.wrist_body_idx = self.robot_body_name_to_idx[WRIST_LINK]
-        # Fingertip body indices (matches reward fingertip_idxs convention)
+        # Fingertip body indices: thumb/index/middle/ring/pinky *_DP (the
+        # collapsed distal phalanges).  Used for fingertip_pos_rel_palm obs.
         self.fingertip_body_idxs = torch.tensor([
-            self.robot_body_name_to_idx[SHARPA_BODY_NAMES[i]] for i in [27, 5, 10, 21, 16]
+            self.robot_body_name_to_idx[n] for n in FINGERTIP_LINKS
         ], dtype=torch.long, device=self.device)
-        # All Sharpa link indices (28 entries, including wrist at index 0)
+        # All Sharpa hand link indices (22 collapsed hand bodies)
         self.all_hand_body_idxs = torch.tensor([
             self.robot_body_name_to_idx[n] for n in SHARPA_BODY_NAMES
         ], dtype=torch.long, device=self.device)
@@ -252,13 +269,63 @@ class DexTrackSharpa(VecTask):
         asset_options = gymapi.AssetOptions()
         asset_options.fix_base_link = True
         asset_options.flip_visual_attachments = False
-        asset_options.collapse_fixed_joints = False
-        asset_options.disable_gravity = False
+        # Asset physics options — ALIGNED to SimToolReal's robot asset
+        # (simtoolreal/env.py L1785-1797), which uses the SAME Franka+Sharpa
+        # robot with NO self-collision blow-up.  `collapse_fixed_joints=True`
+        # merges the fixed-joint mount chain (franka_center/right_hand_flange/
+        # right_hand_wrist/right_hand_C_MC) into panda_link7 and each
+        # *_elastomer/*_fingertip into its *_DP → 30 rigid bodies, 29 DOFs.
+        # Combined with the per-link collision-filter bitmask applied below
+        # (ported from set_robot_asset_rigid_shape_properties), this is what
+        # keeps SimToolReal's sim free of catastrophic self-collision.
+        asset_options.collapse_fixed_joints = True
+        asset_options.disable_gravity = True
         asset_options.thickness = 0.001
         asset_options.angular_damping = 0.01
+        asset_options.linear_damping = 0.01
+        if self.physics_engine == gymapi.SIM_PHYSX:
+            asset_options.use_physx_armature = True
         asset_options.use_mesh_materials = True
         asset_options.default_dof_drive_mode = int(gymapi.DOF_MODE_POS)
         robot_asset = self.gym.load_asset(self.sim, urdf_dir, urdf_file, asset_options)
+
+        # --- Self-collision exclusion: per-link collision-filter bitmask ---
+        # Ported verbatim from SimToolReal's set_robot_asset_rigid_shape_properties
+        # (simtoolreal/env.py L5209-5234).  IsaacGym collision rule: two shapes
+        # collide iff (filterA & filterB) == 0.  We give every body a unique
+        # bit, then for each adjacent (no-collision) pair OR each body's bit
+        # into the other so the pair never collision-checks.  Applied to the
+        # ASSET (set_asset_rigid_shape_properties) so every actor inherits it.
+        rigid_shape_props = self.gym.get_asset_rigid_shape_properties(robot_asset)
+        rb_names = self.gym.get_asset_rigid_body_names(robot_asset)
+        rb_shape_indices = self.gym.get_asset_rigid_body_shape_indices(robot_asset)
+        rb_name_to_shape_indices = {
+            name: (x.start, x.count) for name, x in zip(rb_names, rb_shape_indices)
+        }
+        link_to_adjacent_links = PANDA_SHARPA_RIGHT_LINK_TO_ADJACENT_LINKS
+        assert set(link_to_adjacent_links.keys()) == set(rb_names), (
+            f"adjacency-table keys != asset body names; "
+            f"only in table: {set(link_to_adjacent_links.keys()) - set(rb_names)}; "
+            f"only in asset: {set(rb_names) - set(link_to_adjacent_links.keys())}")
+        assert set(sum(link_to_adjacent_links.values(), [])).issubset(rb_names), (
+            f"adjacency-table values reference unknown bodies: "
+            f"{set(sum(link_to_adjacent_links.values(), [])) - set(rb_names)}")
+        no_collision_pairs = set()
+        for link, adjacent_links in link_to_adjacent_links.items():
+            for adjacent_link in adjacent_links:
+                no_collision_pairs.add(tuple(sorted((link, adjacent_link))))
+        no_collision_pairs = sorted(list(no_collision_pairs))
+        # Assign unique bit per link (up to 32 bits — 30 bodies fits).
+        link_bitmask = {name: 1 << i for i, name in enumerate(rb_names)}
+        for a, b in no_collision_pairs:
+            bit_a, bit_b = link_bitmask[a], link_bitmask[b]
+            link_bitmask[a] |= bit_b
+            link_bitmask[b] |= bit_a
+        for name, (start, count) in rb_name_to_shape_indices.items():
+            bit = link_bitmask[name]
+            for k in range(start, start + count):
+                rigid_shape_props[k].filter = bit
+        self.gym.set_asset_rigid_shape_properties(robot_asset, rigid_shape_props)
 
         self.num_robot_dofs   = self.gym.get_asset_dof_count(robot_asset)
         self.num_robot_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
@@ -272,6 +339,7 @@ class DexTrackSharpa(VecTask):
             if i < NUM_ARM_DOFS:
                 robot_dof_props["stiffness"][i] = self.arm_stiffness
                 robot_dof_props["damping"][i]   = self.arm_damping
+                robot_dof_props["effort"][i]    = self.arm_effort
             else:
                 robot_dof_props["stiffness"][i] = self.hand_stiffness
                 robot_dof_props["damping"][i]   = self.hand_damping
@@ -335,8 +403,21 @@ class DexTrackSharpa(VecTask):
         for i in range(num_envs):
             env = self.gym.create_env(self.sim, lower, upper, num_per_row)
 
+            # Self-collision exclusion is handled once on the ASSET above via a
+            # per-link collision-filter bitmask (ported from SimToolReal's
+            # set_robot_asset_rigid_shape_properties).  Adjacent links — and the
+            # whole fixed-joint mount chain that collapse_fixed_joints merged
+            # into panda_link7 — share filter bits so they never collision-check;
+            # non-adjacent finger↔finger, hand↔object, hand↔table collision is
+            # untouched.  No per-actor shape edits needed.
+            #
+            # create_actor's `filter` arg (5th positional) MUST be -1, exactly
+            # as SimToolReal (simtoolreal/env.py L1992/L2002): -1 = "use the
+            # per-shape collision filters set on the asset".  filter=0 would
+            # instead force-enable ALL self-collisions, silently overwriting
+            # every shape's filter with 0 and nullifying the bitmask above.
             robot_actor = self.gym.create_actor(env, robot_asset, robot_pose,
-                                                 "robot", i, 0, 0)
+                                                 "robot", i, -1, 0)
             self.gym.set_actor_dof_properties(env, robot_actor, robot_dof_props)
             # Enable DOF force sensors so we can later read per-DOF joint torques
             # via acquire_dof_force_tensor (needed for ManipTrans r_power that
@@ -354,7 +435,7 @@ class DexTrackSharpa(VecTask):
                 }
 
             table_actor = self.gym.create_actor(env, table_asset, table_pose,
-                                                 "table", i, 0, 0)
+                                                 "table", i, -1, 0)  # DexTrack table also -1 (L5336)
 
             object_actor = self.gym.create_actor(env, object_asset, object_pose,
                                                   "object", i, 0, 0)
@@ -420,10 +501,13 @@ class DexTrackSharpa(VecTask):
     # Step loop
     # =======================================================================
     def pre_physics_step(self, actions: Tensor, joint_pos_targets=None):
-        """Cumulative residual on kinematic reference.
+        """DexTrack control law: not_use_kine_bias=True + control_arm_via_ik=True.
 
-        actions ∈ [-1, 1] (clipped by VecTask), shape (N, 29).
-        target = ref.dof_pos[t+1] + action_scale * actions
+        actions ∈ [-1, 1], shape (N, 29):
+          [0:6]  -> arm 6-D Cartesian dpose -> damped-least-squares IK -> 7 joints
+          [7:29] -> hand 22-DOF accumulating residual on prev_targets
+        Ref: allegro_hand_tracking_generalist.py L12207-12226 (the branch the
+        wfranka run actually executes — NOT the kinematic-bias L12235 branch).
         """
         actions = actions.to(self.device).clamp(-1.0, 1.0)
         self.last_actions[:] = actions
@@ -432,27 +516,33 @@ class DexTrackSharpa(VecTask):
         if len(env_ids) > 0:
             self.reset_idx(env_ids)
 
-        # ── DexTrack accumulating residual (paper L12219-12225) ────────────
-        # delta_delta_targets = speed_scale × dt × action × 2 × ctlFreqInv
-        # cur_delta_targets_warm += delta_delta_targets
-        # target = ref + cur_delta_targets_warm
-        delta_delta = (self.dof_speed_scale_tsr.unsqueeze(0)
-                        * self.sim_dt * actions * 2.0 * self.control_freq_inv)
-        self.cur_delta_targets_warm[:] = self.cur_delta_targets_warm + delta_delta
+        self.gym.refresh_jacobian_tensors(self.sim)
 
-        # Reference (kinematic bias) target for next frame
-        t_next   = torch.clamp(self.progress_buf + 1, max=self.traj.T - 1)
-        ref_dof  = self.traj.dof_pos[t_next]                   # (N, 29)
-        target   = ref_dof + self.cur_delta_targets_warm
+        # ── Hand: accumulating residual on prev_targets, NO kinematic bias ──
+        # DexTrack L12208/L12211: cur_targets_hand = prev_targets[7:] + delta.
+        delta_targets = (self.dof_speed_scale_tsr.unsqueeze(0)
+                         * self.sim_dt * actions * 2.0 * self.control_freq_inv)
+        cur_targets_hand = self.prev_targets[:, NUM_ARM_DOFS:] + delta_targets[:, NUM_ARM_DOFS:]
 
-        # Clip to joint limits
+        # ── Arm: 6-D Cartesian action -> damped-least-squares IK ────────────
+        # DexTrack L12170-12204/L12217: cur_targets_arm = prev_targets[:7] + delta.
+        dpose = torch.cat([actions[:, 0:3] * self.warm_trans_mult,
+                           actions[:, 3:6] * self.warm_rot_mult], dim=-1)   # (N, 6)
+        jeef   = self.jacobian_tensor[:, self.wrist_body_idx - 1, :, :NUM_ARM_DOFS]  # (N,6,7)
+        jeef_T = jeef.transpose(1, 2)
+        lmbda  = torch.eye(6, device=self.device) * (0.03 ** 2)            # DexTrack dampings=0.03
+        delta_arm = (jeef_T @ torch.inverse(jeef @ jeef_T + lmbda)
+                     @ dpose.unsqueeze(-1)).view(self.num_envs, NUM_ARM_DOFS)
+        cur_targets_arm = self.prev_targets[:, :NUM_ARM_DOFS] + delta_arm
+
+        target = torch.cat([cur_targets_arm, cur_targets_hand], dim=-1)    # (N, 29)
         target = torch.max(torch.min(target, self.robot_dof_upper), self.robot_dof_lower)
-        # Optional action moving-average smoothing
-        if self.action_moving_avg < 1.0:
-            target = (self.action_moving_avg * target
-                      + (1.0 - self.action_moving_avg) * self.prev_targets)
-        self.cur_targets[:] = target
+
+        self.cur_targets[:]  = target
         self.prev_targets[:] = target
+        # DexTrack L12225: cur_delta_targets_warm holds the absolute target
+        # (it is exposed in the proprio obs).
+        self.cur_delta_targets_warm[:] = target
 
         self.gym.set_dof_position_target_tensor(self.sim,
             gymtorch.unwrap_tensor(self.cur_targets))
@@ -475,6 +565,17 @@ class DexTrackSharpa(VecTask):
         # Bookkeeping for logging (VecTask uses self.extras)
         self.extras["successes"] = self.successes.clone()
 
+        # TEMP memory-leak diagnostic — remove after OOM root-cause is settled.
+        self._dbg_step += 1
+        if self._dbg_step % 50 == 0:
+            free, total = torch.cuda.mem_get_info()
+            ta = torch.cuda.memory_allocated() / 1e9
+            tr = torch.cuda.memory_reserved() / 1e9
+            du = (total - free) / 1e9
+            print(f"[MEMDBG step={self._dbg_step}] torch_alloc={ta:.2f}G "
+                  f"torch_reserved={tr:.2f}G device_used={du:.2f}G "
+                  f"non_torch={du - tr:.2f}G", flush=True)
+
     # =======================================================================
     # Reset
     # =======================================================================
@@ -485,26 +586,29 @@ class DexTrackSharpa(VecTask):
     def reset_idx(self, env_ids: Tensor):
         """Reset selected envs to the trajectory.
 
-        Default: every env starts at frame 0 (pre-grasp, physically feasible).
-        DexTrack `random_time` first-reset scattering: on the FIRST reset call
-        after env construction, envs are scattered across the trajectory
-        (random per-env start frame in [0, T-1)); the flag then auto-clears so
-        every subsequent reset returns to frame 0.  This matches DexTrack's
-        L11535-11542 behaviour.
+        Physical state (hand DOF + object root) is ALWAYS written to frame 0
+        (pre-grasp, physically feasible) — matching DexTrack, which resets the
+        physical pose to shadow_hand_default_dof_pos / object_init_state.
+        DexTrack `random_time` is one-shot and scatters only `progress_buf`
+        (the reference index), never the physical pose.
         """
         if len(env_ids) == 0:
             return
         E = len(env_ids)
 
-        # Per-env start frame (default 0; randomized once if random_time was set).
+        # A4-align: PHYSICAL state always resets to frame 0 (start_frames=0);
+        # `random_time` (one-shot) scatters ONLY progress_buf — never the
+        # physical pose.  Cf. allegro_hand_tracking_generalist.py L11358 /
+        # L11503 (physical -> frame 0) and L11537-11544 (random_time -> idx).
+        start_frames = torch.zeros(E, dtype=torch.long, device=self.device)
         if self._random_time_pending:
-            start_frames = torch.randint(0, self.traj.T - 1, (E,),
-                                          device=self.device, dtype=torch.long)
+            start_progress = torch.randint(0, self.episode_T, (E,),
+                                            device=self.device, dtype=torch.long)
             self._random_time_pending = False
-            print(f"[DexTrackSharpa] random_time scattering: "
-                  f"{E} envs spread over frames [0, {self.traj.T - 2}]")
+            print(f"[DexTrackSharpa] random_time: progress_buf scattered over "
+                  f"[0,{self.episode_T}); physical state -> frame 0")
         else:
-            start_frames = torch.zeros(E, dtype=torch.long, device=self.device)
+            start_progress = torch.zeros(E, dtype=torch.long, device=self.device)
 
         # 1) DOF state: pos = traj.dof_pos[start_frames], vel = 0
         dof_pos_init = self.traj.dof_pos[start_frames]              # (E, 29)
@@ -538,22 +642,23 @@ class DexTrackSharpa(VecTask):
             gymtorch.unwrap_tensor(env_ids_i32_rob), E)
 
         # Counters
-        self.progress_buf[env_ids] = start_frames
+        self.progress_buf[env_ids] = start_progress
         self.reset_buf[env_ids]    = 0
         self.successes[env_ids]    = 0
         self.last_reward[env_ids]  = 0
-        # Reset accumulating residual (paper resets cur_delta_targets_warm per episode)
-        self.cur_delta_targets_warm[env_ids] = 0
+        # DexTrack L11377-11379: with not_use_kine_bias, cur_delta_targets_warm
+        # initialises to the frame-0 pose (it holds the absolute target).
+        self.cur_delta_targets_warm[env_ids] = dof_pos_init
         self.prev_dof_vel[env_ids] = 0
 
     # =======================================================================
     # Reward + termination
     # =======================================================================
     def _build_state_dict(self) -> Dict[str, Tensor]:
-        # Robot hand links: per-env (28, 13)
+        # Robot hand links: per-env (22, 13)
         body = self.rigid_body_state                                   # (E, B, 13)
         wrist = body[:, self.wrist_body_idx]                           # (E, 13)
-        hand_links = body[:, self.all_hand_body_idxs]                  # (E, 28, 13)
+        hand_links = body[:, self.all_hand_body_idxs]                  # (E, 22, 13)
 
         obj_root = self.root_states[self.object_actor_idx_global.long(), :]  # (E, 13)
 

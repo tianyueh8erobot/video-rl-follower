@@ -8,9 +8,9 @@ and pre-computes:
   - obj_quat    : (T, 4)          xyzw
   - obj_lin_vel : (T, 3)
   - obj_ang_vel : (T, 3)
-  - link_pos    : (T, K, 3)       K = 28 body_names per Sharpa class (FK at each frame)
+  - link_pos    : (T, K, 3)       K = 22 collapsed Sharpa hand bodies (FK at each frame)
   - link_vel    : (T, K, 3)
-  - wrist_pos   : (T, 3)          right_hand_C_MC origin
+  - wrist_pos   : (T, 3)          panda_link7 origin (collapsed hand base)
   - wrist_quat  : (T, 4)          xyzw
   - wrist_vel   : (T, 3)
   - wrist_ang_vel: (T, 3)
@@ -31,25 +31,36 @@ from scipy.spatial.transform import Rotation as R
 
 
 # ---------------------------------------------------------------------------
-# Sharpa body_names (28 entries; matches ManipTrans/dexhands/sharpa.py)
-# index 0 = wrist (right_hand_C_MC); 1-27 follow the standard Sharpa chain.
+# Sharpa hand body_names (22 entries) — the COLLAPSED body set produced by
+# `collapse_fixed_joints=True` on the Franka+Sharpa asset.  The fixed-joint
+# mount chain + palm (right_hand_C_MC) merge into panda_link7, and each
+# *_elastomer / *_fingertip merges into its *_DP, leaving 22 hand bodies.
+# Order matches the IsaacGym asset rigid-body order (bodies 8-29).
 # ---------------------------------------------------------------------------
 SHARPA_BODY_NAMES = [
-    "right_hand_C_MC",
-    # index 1-5
-    "right_index_MCP_VL", "right_index_PP", "right_index_MP", "right_index_DP", "right_index_fingertip",
-    # middle 6-10
-    "right_middle_MCP_VL", "right_middle_PP", "right_middle_MP", "right_middle_DP", "right_middle_fingertip",
-    # pinky 11-16
-    "right_pinky_MC", "right_pinky_MCP_VL", "right_pinky_PP", "right_pinky_MP", "right_pinky_DP", "right_pinky_fingertip",
-    # ring 17-21
-    "right_ring_MCP_VL", "right_ring_PP", "right_ring_MP", "right_ring_DP", "right_ring_fingertip",
-    # thumb 22-27
-    "right_thumb_CMC_VL", "right_thumb_MC", "right_thumb_MCP_VL", "right_thumb_PP", "right_thumb_DP", "right_thumb_fingertip",
+    # index
+    "right_index_MCP_VL", "right_index_PP", "right_index_MP", "right_index_DP",
+    # middle
+    "right_middle_MCP_VL", "right_middle_PP", "right_middle_MP", "right_middle_DP",
+    # pinky
+    "right_pinky_MC", "right_pinky_MCP_VL", "right_pinky_PP", "right_pinky_MP", "right_pinky_DP",
+    # ring
+    "right_ring_MCP_VL", "right_ring_PP", "right_ring_MP", "right_ring_DP",
+    # thumb
+    "right_thumb_CMC_VL", "right_thumb_MC", "right_thumb_MCP_VL", "right_thumb_PP", "right_thumb_DP",
 ]
-assert len(SHARPA_BODY_NAMES) == 28
+assert len(SHARPA_BODY_NAMES) == 22
 
-WRIST_LINK = "right_hand_C_MC"
+# After collapse_fixed_joints=True the palm (right_hand_C_MC) and the whole
+# fixed-joint mount chain merge into panda_link7 — that body is now the
+# hand-base / wrist body.
+WRIST_LINK = "panda_link7"
+
+# Fingertip bodies after collapse = the distal phalanges (*_elastomer /
+# *_fingertip merged into *_DP).  Thumb, index, middle, ring, pinky.
+FINGERTIP_LINKS = ["right_thumb_DP", "right_index_DP", "right_middle_DP",
+                   "right_ring_DP", "right_pinky_DP"]
+FINGERTIP_IDXS = [SHARPA_BODY_NAMES.index(n) for n in FINGERTIP_LINKS]
 
 
 def _strip_mujoco(s: str) -> str:
@@ -216,7 +227,7 @@ def _smoke_test():
     t = torch.tensor([0, 1, 50, 150, 299], device="cuda:0")
     s = traj.get(t)
     assert s["dof_pos"].shape == (5, 29)
-    assert s["link_pos"].shape == (5, 28, 3)
+    assert s["link_pos"].shape == (5, 22, 3)
     print(f"  ✓ smoke test passed")
 
 

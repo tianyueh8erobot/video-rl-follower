@@ -27,6 +27,13 @@ env:
   dofSpeedScale:            1.0
   frankaDeltaDeltaMultCoef: 2.0
   actionMovingAverage:      1.0             # 1.0 disables smoothing
+  # Cartesian-IK arm control (DexTrack control_arm_via_ik=True): the 7 Franka
+  # joints are driven by a 6-D Cartesian dpose through damped-least-squares IK.
+  # warm_*_actions_mult_coef = 0.01 — the wfranka run-script value
+  # (run_tracking_headless_grab_single_wfranka.sh L1765-1766).  The 0.04 we had
+  # was only the AllegroHandTrackingGeneralist.yaml default (the run overrides it).
+  warmTransActionsMultCoef: 0.01
+  warmRotActionsMultCoef:   0.01
 
   # --- Reset behaviour ---
   # DexTrack `random_time` (one-shot scattering on the first reset only — all
@@ -67,7 +74,7 @@ env:
       cur_ornt_rew_coef:    0.33
       # ── Success / early terminate ──────────────────────────────────────
       success_obj_pos_thresh:   0.05   # paper L12998
-      early_terminate_obj_dist: 0.2    # paper default; 0 disables
+      early_terminate_obj_dist: 0.0    # A3-align: DexTrack run resolves early_terminate=False
       # ── Smoothness (paper L12780; default off matches paper) ───────────
       smoothness_coef:      0.0
     maniptrans:
@@ -75,14 +82,14 @@ env:
       failed_execute_progress_threshold: 20
       scale_factor: 1.0                     # 1.0 = paper thresholds verbatim
 
-  # --- Robot PD gains (VERIFIED from DexTrack's actual train_pool_2.py run command) ---
-  #   arm:  arm_stiffness=400.0  arm_damping=80.0
-  #   hand: stiffness_coef=210.0  damping_coef=20.0  effort_coef=0.95
-  #   DexTrack applies stiffness_coef / damping_coef / effort_coef DIRECTLY to the
-  #   hand DOF props (allegro_hand_tracking_generalist.py L4798-4800).
-  #   (earlier 100/4 were DexTrack's yaml defaults, NOT the run-script overrides.)
+  # --- Robot PD gains (VERIFIED from the wfranka run script — actual last-wins
+  #     export values, run_tracking_headless_grab_single_wfranka.sh) ---
+  #   arm:  arm_stiffness=400  arm_effort=400  arm_damping=80   (L1016-1018)
+  #   hand: stiffness_coef=210  damping_coef=20  effort_coef=0.95
+  #   Applied to the DOF props at allegro_hand_tracking_generalist.py L4793-4800.
   armStiffness:  400.0
   armDamping:    80.0
+  armEffort:     400.0
   handStiffness: 210.0
   handDamping:   20.0
   handEffort:    0.95

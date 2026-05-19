@@ -113,8 +113,11 @@ def compute_dextrack_reward(
 
     # ─── Finger / wrist distances to object ────────────────────────────────
     # DexTrack tracking uses 4 fingertips (thumb/index/middle/ring; pinky
-    # commented at L12698).  Body indices follow SHARPA_BODY_NAMES.
-    fingertip_idxs = [27, 5, 10, 21]
+    # commented at L12698).  Body indices follow SHARPA_BODY_NAMES (the 22
+    # COLLAPSED hand bodies).  Indices = the thumb/index/middle/ring *_DP
+    # (distal-phalanx) bodies: right_thumb_DP=21, right_index_DP=3,
+    # right_middle_DP=7, right_ring_DP=16.
+    fingertip_idxs = [21, 3, 7, 16]
     num_fingers = len(fingertip_idxs)
     tip_pos    = state["link_pos"][:, fingertip_idxs]                # (N, 4, 3)
     obj_pos_b  = state["obj_pos"][:, None, :]
@@ -229,8 +232,8 @@ def _smoke_test():
         "obj_quat":      torch.tensor([[0, 0, 0, 1.]] * N, device=device),
         "obj_lin_vel":   torch.zeros(N, 3, device=device),
         "obj_ang_vel":   torch.zeros(N, 3, device=device),
-        "link_pos":      torch.zeros(N, 28, 3, device=device),
-        "link_vel":      torch.zeros(N, 28, 3, device=device),
+        "link_pos":      torch.zeros(N, 22, 3, device=device),
+        "link_vel":      torch.zeros(N, 22, 3, device=device),
         "wrist_pos":     torch.zeros(N, 3, device=device),
         "wrist_quat":    torch.tensor([[0, 0, 0, 1.]] * N, device=device),
         "wrist_vel":     torch.zeros(N, 3, device=device),
